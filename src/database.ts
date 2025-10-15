@@ -108,6 +108,20 @@ export type UserRecord = {
     updated_at: string;
 };
 
+export type BuyOrderRecord = {
+    id: number;
+    guild_id: string;
+    user_id: string;
+    item: string;
+    price: number;
+    amount: number | null;
+    attachment_url: string | null;
+    announcement_channel_id: string | null;
+    announcement_message_id: string | null;
+    created_at: string;
+    updated_at: string;
+};
+
 export async function initializeDatabase(): Promise<void> {
     db.run("PRAGMA journal_mode = WAL;");
     db.run("PRAGMA foreign_keys = ON;");
@@ -163,6 +177,24 @@ export async function initializeDatabase(): Promise<void> {
             cancel_button_custom_id TEXT,
             status TEXT NOT NULL CHECK (status IN ('open','matched','escrow','complete','selled','cancelled','expired')),
             reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    `);
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS buy_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            item TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            amount INTEGER,
+            attachment_url TEXT,
+            announcement_channel_id TEXT,
+            announcement_message_id TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
@@ -575,6 +607,49 @@ export async function createTrade(params: {
     return row;
 }
 
+export async function createBuyOrder(params: {
+    guildId: string;
+    userId: string;
+    item: string;
+    price: number;
+    amount?: number | null;
+    attachmentUrl?: string | null;
+}): Promise<BuyOrderRecord> {
+    if (!Number.isInteger(params.price) || params.price <= 0) {
+        throw new Error("Price must be a positive integer value");
+    }
+
+    let amount: number | null = null;
+    if (params.amount !== undefined && params.amount !== null) {
+        if (!Number.isInteger(params.amount) || params.amount <= 0) {
+            throw new Error("Amount must be a positive integer value when provided");
+        }
+        amount = params.amount;
+    }
+
+    const row = get<BuyOrderRecord>(
+        `
+        INSERT INTO buy_orders (guild_id, user_id, item, price, amount, attachment_url)
+        VALUES (:guildId, :userId, :item, :price, :amount, :attachmentUrl)
+        RETURNING *
+        `,
+        {
+            guildId: params.guildId,
+            userId: params.userId,
+            item: params.item,
+            price: params.price,
+            amount,
+            attachmentUrl: params.attachmentUrl ?? null,
+        },
+    );
+
+    if (!row) {
+        throw new Error("Failed to create buy order record");
+    }
+
+    return row;
+}
+
 export async function updateTradeAnnouncementMetadata(params: {
     tradeId: number;
     channelId?: string | null;
@@ -622,6 +697,40 @@ export async function updateTradeAnnouncementMetadata(params: {
         UPDATE trades
         SET ${updates.join(",\n            ")}
         WHERE id = :tradeId
+        `,
+        queryParams,
+    );
+}
+
+export async function updateBuyOrderAnnouncementMetadata(params: {
+    orderId: number;
+    channelId?: string | null;
+    messageId?: string | null;
+}): Promise<void> {
+    const updates: string[] = [];
+    const queryParams: QueryParams = { orderId: params.orderId };
+
+    if (params.channelId !== undefined) {
+        updates.push("announcement_channel_id = :channelId");
+        queryParams.channelId = params.channelId ?? null;
+    }
+
+    if (params.messageId !== undefined) {
+        updates.push("announcement_message_id = :messageId");
+        queryParams.messageId = params.messageId ?? null;
+    }
+
+    if (updates.length === 0) {
+        return;
+    }
+
+    updates.push("updated_at = datetime('now')");
+
+    run(
+        `
+        UPDATE buy_orders
+        SET ${updates.join(",\n            ")}
+        WHERE id = :orderId
         `,
         queryParams,
     );
@@ -809,6 +918,32 @@ export async function listTrades(params: {
         FROM trades
         WHERE guild_id = :guildId
         ORDER BY created_at DESC
+        LIMIT :limit OFFSET :offset
+        `,
+        {
+            guildId: params.guildId,
+            limit: pageSize,
+            offset,
+        },
+    );
+}
+
+export async function listBuyOrders(params: {
+    guildId: string;
+    page?: number;
+    pageSize?: number;
+}): Promise<BuyOrderRecord[]> {
+    const page = Math.max(1, params.page ?? 1);
+    const pageSize = Math.max(1, Math.min(params.pageSize ?? 10, 25));
+    const offset = (page - 1) * pageSize;
+
+    return all<BuyOrderRecord>(
+        `
+        SELECT *
+        FROM buy_orders
+        WHERE guild_id = :guildId
+        ORDER BY created_at DESC
+        LIMIT :limit OFFSET :offset
         `,
         {
             guildId: params.guildId,

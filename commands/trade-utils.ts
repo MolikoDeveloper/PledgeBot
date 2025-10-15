@@ -1,7 +1,13 @@
-import type { TradeRecord, TradeStatus, UserRecord } from "../src/database";
+import type { BuyOrderRecord, TradeRecord, TradeStatus, UserRecord } from "../src/database";
 import type { MessageComponent } from "./types";
 
 const numberFormatter = new Intl.NumberFormat("en-US");
+
+export type AnnouncementResult = {
+    url: string | null;
+    messageId: string | null;
+    messageChannelId: string | null;
+};
 
 export function resolveStatusLabel(status: TradeStatus): string {
     switch (status) {
@@ -117,6 +123,49 @@ export function buildTradeAnnouncementContent(params: {
     return `${base} — ${numberFormatter.format(params.trade.auec)} aUEC`;
 }
 
+export function buildBuyOrderEmbed(params: {
+    order: BuyOrderRecord;
+    userTag: string;
+}): Record<string, unknown> {
+    const { order, userTag } = params;
+
+    const fields: Array<{ name: string; value: string; inline?: boolean }> = [
+        { name: "Price", value: `${numberFormatter.format(order.price)} aUEC`, inline: true },
+        { name: "Order ID", value: `#${order.id}`, inline: true },
+    ];
+
+    if (order.amount !== null) {
+        fields.splice(1, 0, { name: "Desired Amount", value: `${order.amount}`, inline: true });
+    }
+
+    const embed: Record<string, unknown> = {
+        title: `Looking to buy: ${order.item}`,
+        color: 0x1d4ed8,
+        fields,
+        timestamp: new Date(order.created_at).toISOString(),
+        footer: { text: `Buyer: ${userTag}` },
+    };
+
+    if (order.attachment_url) {
+        embed.image = { url: order.attachment_url };
+    }
+
+    return embed;
+}
+
+export function buildBuyOrderAnnouncementContent(params: {
+    order: BuyOrderRecord;
+    userId: string;
+}): string {
+    const base = `New buy order from <@${params.userId}>`;
+
+    if (params.order.amount !== null) {
+        return `${base} — Offering ${numberFormatter.format(params.order.price)} aUEC for ${params.order.amount} unit(s)`;
+    }
+
+    return `${base} — Offering ${numberFormatter.format(params.order.price)} aUEC`;
+}
+
 export function buildAnnouncementUrl(params: {
     guildId: string;
     channelId: string | null;
@@ -162,4 +211,80 @@ export async function patchTradeAnnouncement(params: {
         const message = await response.text();
         throw new Error(`Failed to update trade announcement: ${response.status} ${message}`);
     }
+}
+
+export async function deliverTradeAnnouncement(params: {
+    token: string;
+    guildId: string;
+    channelId: string;
+    channelType: "text" | "forum";
+    content: string;
+    threadName: string;
+    embed: Record<string, unknown>;
+    userId: string;
+}): Promise<AnnouncementResult> {
+    const baseHeaders = {
+        Authorization: `Bot ${params.token}`,
+        "Content-Type": "application/json",
+    } satisfies Record<string, string>;
+
+    const allowedMentions = {
+        parse: [] as string[],
+        users: [params.userId],
+    };
+
+    if (params.channelType === "text") {
+        const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/messages`, {
+            method: "POST",
+            headers: baseHeaders,
+            body: JSON.stringify({
+                content: params.content,
+                embeds: [params.embed],
+                allowed_mentions: allowedMentions,
+            }),
+        });
+
+        if (!response.ok) {
+            const message = await response.text();
+            throw new Error(`Failed to post trade announcement: ${response.status} ${message}`);
+        }
+
+        const messageData = (await response.json()) as { id?: string | null };
+        const messageId = messageData.id ?? null;
+        return {
+            url: messageId ? `https://discord.com/channels/${params.guildId}/${params.channelId}/${messageId}` : null,
+            messageId,
+            messageChannelId: messageId ? params.channelId : null,
+        };
+    }
+
+    const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/threads`, {
+        method: "POST",
+        headers: baseHeaders,
+        body: JSON.stringify({
+            name: params.threadName,
+            message: {
+                content: params.content,
+                embeds: [params.embed],
+                allowed_mentions: allowedMentions,
+            },
+        }),
+    });
+
+    if (!response.ok) {
+        const message = await response.text();
+        throw new Error(`Failed to create forum thread: ${response.status} ${message}`);
+    }
+
+    const threadData = (await response.json()) as {
+        id?: string | null;
+        message?: { id?: string | null } | null;
+    };
+    const threadId = threadData.id ?? null;
+    const starterMessageId = threadData.message?.id ?? null;
+    return {
+        url: threadId ? `https://discord.com/channels/${params.guildId}/${threadId}` : null,
+        messageId: starterMessageId,
+        messageChannelId: starterMessageId && threadId ? threadId : null,
+    };
 }

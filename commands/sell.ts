@@ -33,6 +33,7 @@ import {
     buildAnnouncementUrl,
     buildTradeAnnouncementContent,
     buildTradeEmbed,
+    deliverTradeAnnouncement,
     patchTradeAnnouncement,
     resolveStatusLabel,
     resolveUserTag,
@@ -121,12 +122,6 @@ const commandData: CommandData = {
 const numberFormatter = new Intl.NumberFormat("en-US");
 
 type OptionLookup = Record<string, InteractionDataOption | undefined>;
-
-type AnnouncementResult = {
-    url: string | null;
-    messageId: string | null;
-    messageChannelId: string | null;
-};
 
 type SubcommandName = "create" | "done" | "discount";
 
@@ -257,82 +252,6 @@ function resolveImageUrl(attachment: InteractionAttachment | null): string | nul
     }
 
     return attachment.url ?? null;
-}
-
-async function deliverTradeAnnouncement(params: {
-    token: string;
-    guildId: string;
-    channelId: string;
-    channelType: "text" | "forum";
-    content: string;
-    threadName: string;
-    embed: Record<string, unknown>;
-    userId: string;
-}): Promise<AnnouncementResult> {
-    const baseHeaders = {
-        Authorization: `Bot ${params.token}`,
-        "Content-Type": "application/json",
-    } satisfies Record<string, string>;
-
-    const allowedMentions = {
-        parse: [] as string[],
-        users: [params.userId],
-    };
-
-    if (params.channelType === "text") {
-        const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/messages`, {
-            method: "POST",
-            headers: baseHeaders,
-            body: JSON.stringify({
-                content: params.content,
-                embeds: [params.embed],
-                allowed_mentions: allowedMentions,
-            }),
-        });
-
-        if (!response.ok) {
-            const message = await response.text();
-            throw new Error(`Failed to post trade announcement: ${response.status} ${message}`);
-        }
-
-        const messageData = (await response.json()) as { id?: string | null };
-        const messageId = messageData.id ?? null;
-        return {
-            url: messageId ? `https://discord.com/channels/${params.guildId}/${params.channelId}/${messageId}` : null,
-            messageId,
-            messageChannelId: messageId ? params.channelId : null,
-        };
-    }
-
-    const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/threads`, {
-        method: "POST",
-        headers: baseHeaders,
-        body: JSON.stringify({
-            name: params.threadName,
-            message: {
-                content: params.content,
-                embeds: [params.embed],
-                allowed_mentions: allowedMentions,
-            },
-        }),
-    });
-
-    if (!response.ok) {
-        const message = await response.text();
-        throw new Error(`Failed to create forum thread: ${response.status} ${message}`);
-    }
-
-    const threadData = (await response.json()) as {
-        id?: string | null;
-        message?: { id?: string | null } | null;
-    };
-    const threadId = threadData.id ?? null;
-    const starterMessageId = threadData.message?.id ?? null;
-    return {
-        url: threadId ? `https://discord.com/channels/${params.guildId}/${threadId}` : null,
-        messageId: starterMessageId,
-        messageChannelId: starterMessageId && threadId ? threadId : null,
-    };
 }
 
 async function handleCreateSubcommand(params: {
