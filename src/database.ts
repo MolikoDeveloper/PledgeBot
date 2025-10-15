@@ -71,6 +71,7 @@ export const trade_status = [
     "matched",
     "escrow",
     "complete",
+    "selled",
     "cancelled",
     "expired",
 ] as const;
@@ -87,7 +88,8 @@ export type TradeRecord = {
     image_url: string | null;
     announcement_channel_id: string | null;
     announcement_message_id: string | null;
-    close_button_custom_id: string | null;
+    done_one_button_custom_id: string | null;
+    done_all_button_custom_id: string | null;
     cancel_button_custom_id: string | null;
     status: TradeStatus;
     reason: string | null;
@@ -152,9 +154,10 @@ export async function initializeDatabase(): Promise<void> {
             image_url TEXT,
             announcement_channel_id TEXT,
             announcement_message_id TEXT,
-            close_button_custom_id TEXT,
+            done_one_button_custom_id TEXT,
+            done_all_button_custom_id TEXT,
             cancel_button_custom_id TEXT,
-            status TEXT NOT NULL CHECK (status IN ('open','matched','escrow','complete','cancelled','expired')),
+            status TEXT NOT NULL CHECK (status IN ('open','matched','escrow','complete','selled','cancelled','expired')),
             reason TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -174,8 +177,116 @@ export async function initializeDatabase(): Promise<void> {
         )
     `);
 
-    const tradeColumns = db.prepare(`PRAGMA table_info(trades)`).all() as { name: string }[];
-    const tradeColumnNames = new Set(tradeColumns.map((column) => column.name));
+    let tradeColumns = db.prepare(`PRAGMA table_info(trades)`).all() as { name: string }[];
+    let tradeColumnNames = new Set(tradeColumns.map((column) => column.name));
+
+    const tradesTableDefinition = db
+        .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'trades'`)
+        .get() as { sql: string | null } | undefined;
+
+    const tradesTableSql = tradesTableDefinition?.sql ?? "";
+
+    if (tradeColumnNames.size > 0 && !tradesTableSql.includes("'selled'")) {
+        const selectAnnouncementChannel = tradeColumnNames.has("announcement_channel_id")
+            ? "announcement_channel_id"
+            : "NULL";
+        const selectAnnouncementMessage = tradeColumnNames.has("announcement_message_id")
+            ? "announcement_message_id"
+            : "NULL";
+        const selectDoneOne = tradeColumnNames.has("done_one_button_custom_id")
+            ? "done_one_button_custom_id"
+            : tradeColumnNames.has("close_button_custom_id")
+              ? "close_button_custom_id"
+              : "NULL";
+        const selectDoneAll = tradeColumnNames.has("done_all_button_custom_id")
+            ? "done_all_button_custom_id"
+            : "NULL";
+        const selectCancel = tradeColumnNames.has("cancel_button_custom_id")
+            ? "cancel_button_custom_id"
+            : "NULL";
+        const selectReason = tradeColumnNames.has("reason") ? "reason" : "NULL";
+        const selectCreatedAt = tradeColumnNames.has("created_at")
+            ? "created_at"
+            : "datetime('now')";
+        const selectUpdatedAt = tradeColumnNames.has("updated_at")
+            ? "updated_at"
+            : "datetime('now')";
+
+        const recreateTradesTable = db.transaction(() => {
+            db.run(`ALTER TABLE trades RENAME TO trades_old`);
+
+            db.run(`
+                CREATE TABLE trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    auec INTEGER NOT NULL,
+                    stock INTEGER NOT NULL DEFAULT 1,
+                    image_url TEXT,
+                    announcement_channel_id TEXT,
+                    announcement_message_id TEXT,
+                    done_one_button_custom_id TEXT,
+                    done_all_button_custom_id TEXT,
+                    cancel_button_custom_id TEXT,
+                    status TEXT NOT NULL CHECK (status IN ('open','matched','escrow','complete','selled','cancelled','expired')),
+                    reason TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            `);
+
+            db.run(
+                `
+                INSERT INTO trades (
+                    id,
+                    guild_id,
+                    user_id,
+                    title,
+                    auec,
+                    stock,
+                    image_url,
+                    announcement_channel_id,
+                    announcement_message_id,
+                    done_one_button_custom_id,
+                    done_all_button_custom_id,
+                    cancel_button_custom_id,
+                    status,
+                    reason,
+                    created_at,
+                    updated_at
+                )
+                SELECT
+                    id,
+                    guild_id,
+                    user_id,
+                    title,
+                    auec,
+                    stock,
+                    image_url,
+                    ${selectAnnouncementChannel} AS announcement_channel_id,
+                    ${selectAnnouncementMessage} AS announcement_message_id,
+                    ${selectDoneOne} AS done_one_button_custom_id,
+                    ${selectDoneAll} AS done_all_button_custom_id,
+                    ${selectCancel} AS cancel_button_custom_id,
+                    status,
+                    ${selectReason} AS reason,
+                    ${selectCreatedAt} AS created_at,
+                    ${selectUpdatedAt} AS updated_at
+                FROM trades_old
+                `,
+            );
+
+            db.run(`DROP TABLE trades_old`);
+        });
+
+        recreateTradesTable();
+
+        tradeColumns = db.prepare(`PRAGMA table_info(trades)`).all() as { name: string }[];
+        tradeColumnNames = new Set(tradeColumns.map((column) => column.name));
+    }
 
     if (!tradeColumnNames.has("announcement_channel_id")) {
         db.run(`ALTER TABLE trades ADD COLUMN announcement_channel_id TEXT`);
@@ -185,8 +296,16 @@ export async function initializeDatabase(): Promise<void> {
         db.run(`ALTER TABLE trades ADD COLUMN announcement_message_id TEXT`);
     }
 
-    if (!tradeColumnNames.has("close_button_custom_id")) {
-        db.run(`ALTER TABLE trades ADD COLUMN close_button_custom_id TEXT`);
+    if (!tradeColumnNames.has("done_one_button_custom_id")) {
+        if (tradeColumnNames.has("close_button_custom_id")) {
+            db.run(`ALTER TABLE trades RENAME COLUMN close_button_custom_id TO done_one_button_custom_id`);
+        } else {
+            db.run(`ALTER TABLE trades ADD COLUMN done_one_button_custom_id TEXT`);
+        }
+    }
+
+    if (!tradeColumnNames.has("done_all_button_custom_id")) {
+        db.run(`ALTER TABLE trades ADD COLUMN done_all_button_custom_id TEXT`);
     }
 
     if (!tradeColumnNames.has("cancel_button_custom_id")) {
@@ -440,7 +559,8 @@ export async function updateTradeAnnouncementMetadata(params: {
     tradeId: number;
     channelId?: string | null;
     messageId?: string | null;
-    closeButtonId?: string | null;
+    doneOneButtonId?: string | null;
+    doneAllButtonId?: string | null;
     cancelButtonId?: string | null;
 }): Promise<void> {
     const updates: string[] = [];
@@ -456,9 +576,14 @@ export async function updateTradeAnnouncementMetadata(params: {
         queryParams.messageId = params.messageId ?? null;
     }
 
-    if (params.closeButtonId !== undefined) {
-        updates.push("close_button_custom_id = :closeButtonId");
-        queryParams.closeButtonId = params.closeButtonId ?? null;
+    if (params.doneOneButtonId !== undefined) {
+        updates.push("done_one_button_custom_id = :doneOneButtonId");
+        queryParams.doneOneButtonId = params.doneOneButtonId ?? null;
+    }
+
+    if (params.doneAllButtonId !== undefined) {
+        updates.push("done_all_button_custom_id = :doneAllButtonId");
+        queryParams.doneAllButtonId = params.doneAllButtonId ?? null;
     }
 
     if (params.cancelButtonId !== undefined) {
@@ -561,6 +686,32 @@ export async function updateTradeStatus(params: {
             tradeId: params.tradeId,
             status: params.status,
             reason: params.reason ?? null,
+        },
+    );
+}
+
+export async function reduceTradeStock(params: {
+    tradeId: number;
+    amount: number;
+}): Promise<TradeRecord | null> {
+    if (!Number.isInteger(params.amount) || params.amount <= 0) {
+        throw new Error("Amount must be a positive integer");
+    }
+
+    return get<TradeRecord>(
+        `
+        UPDATE trades
+        SET stock = stock - :amount,
+            status = CASE WHEN stock - :amount <= 0 THEN 'selled' ELSE status END,
+            updated_at = datetime('now')
+        WHERE id = :tradeId
+            AND stock >= :amount
+            AND status = 'open'
+        RETURNING *
+        `,
+        {
+            tradeId: params.tradeId,
+            amount: params.amount,
         },
     );
 }
