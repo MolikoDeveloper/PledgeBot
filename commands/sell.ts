@@ -31,12 +31,16 @@ import {
 } from "./types";
 import {
     buildAnnouncementUrl,
+    buildSellThreadName,
     buildTradeAnnouncementContent,
     buildTradeEmbed,
     deliverTradeAnnouncement,
     patchTradeAnnouncement,
+    resolveForumThreadId,
     resolveStatusLabel,
     resolveUserTag,
+    shouldArchiveSellThread,
+    updateForumThread,
 } from "./trade-utils";
 
 const commandData: CommandData = {
@@ -254,6 +258,47 @@ function resolveImageUrl(attachment: InteractionAttachment | null): string | nul
     return attachment.url ?? null;
 }
 
+type GuildTradeConfig = Awaited<ReturnType<typeof getTradeConfig>>;
+
+function resolveForumThreadIdForTrade(trade: TradeRecord, tradeConfig: GuildTradeConfig): string | null {
+    return resolveForumThreadId({
+        announcementChannelId: trade.announcement_channel_id,
+        tradeChannelId: tradeConfig.tradeChannelId,
+        tradeChannelType: tradeConfig.tradeChannelType,
+    });
+}
+
+async function syncSellForumThread(params: {
+    config: CommandExecuteContext["config"];
+    tradeConfig: GuildTradeConfig;
+    trade: TradeRecord;
+}): Promise<Error | null> {
+    if (params.config.allowOffline) {
+        return null;
+    }
+
+    const threadId = resolveForumThreadIdForTrade(params.trade, params.tradeConfig);
+    if (!threadId) {
+        return null;
+    }
+
+    const archiveThread = shouldArchiveSellThread(params.trade.status);
+
+    try {
+        await updateForumThread({
+            token: params.config.botToken,
+            threadId,
+            name: buildSellThreadName(params.trade),
+            ...(archiveThread ? { archived: true, locked: true } : {}),
+        });
+        return null;
+    } catch (error) {
+        const err = error instanceof Error ? error : new Error("Unknown forum thread update failure.");
+        console.error(`Failed to update forum thread for trade #${params.trade.id}`, error);
+        return err;
+    }
+}
+
 async function handleCreateSubcommand(params: {
     interaction: CommandExecuteContext["interaction"];
     config: CommandExecuteContext["config"];
@@ -338,7 +383,7 @@ async function handleCreateSubcommand(params: {
     });
 
     const content = buildTradeAnnouncementContent({ trade, userId: user.id });
-    const threadName = `${trade.title} (#${trade.id})`;
+    const threadName = buildSellThreadName(trade);
 
     let announcementUrl: string | null = null;
     let announcementError: Error | null = null;
@@ -347,6 +392,10 @@ async function handleCreateSubcommand(params: {
 
     if (!config.allowOffline) {
         try {
+            const appliedTags =
+                tradeConfig.tradeChannelType === "forum" && tradeConfig.sellForumTagId
+                    ? [tradeConfig.sellForumTagId]
+                    : undefined;
             const result = await deliverTradeAnnouncement({
                 token: config.botToken,
                 guildId,
@@ -356,6 +405,7 @@ async function handleCreateSubcommand(params: {
                 threadName,
                 embed,
                 userId: user.id,
+                appliedTags,
             });
             announcementUrl = result.url;
 
@@ -462,6 +512,7 @@ async function handleDoneSubcommand(params: {
         return buildReply(`Trade #${trade.id} has no remaining stock.`);
     }
 
+    const tradeConfig = await getTradeConfig(interaction.guild_id!);
     const updated = await reduceTradeStock({ tradeId: trade.id, amount });
     if (!updated) {
         return buildReply(
@@ -507,6 +558,7 @@ async function handleDoneSubcommand(params: {
 
     let announcementPatchError: Error | null = null;
     let missingAnnouncementMetadata = false;
+    let threadUpdateError: Error | null = null;
 
     if (!config.allowOffline) {
         if (updated.announcement_channel_id && updated.announcement_message_id) {
@@ -529,6 +581,8 @@ async function handleDoneSubcommand(params: {
         }
     }
 
+    threadUpdateError = await syncSellForumThread({ config, tradeConfig, trade: updated });
+
     const amountText = amount === 1 ? "1 item" : `${amount} items`;
     const responseLines = [
         `Marked ${amountText} as done for trade #${updated.id}.`,
@@ -538,6 +592,7 @@ async function handleDoneSubcommand(params: {
         missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
         announcementPatchError ? "Warning: Failed to update the trade announcement." : undefined,
         metadataError ? "Warning: Failed to update stored control metadata." : undefined,
+        threadUpdateError ? "Warning: Failed to update the trade forum thread." : undefined,
     ].filter(Boolean);
 
     return buildReply(responseLines.join("\n"), replyComponents.length > 0 ? replyComponents : undefined);
@@ -577,6 +632,7 @@ async function handleDiscountSubcommand(params: {
         return buildReply(`Trade #${trade.id} is already ${statusLabel}.`);
     }
 
+    const tradeConfig = await getTradeConfig(interaction.guild_id!);
     const normalizedPercent = percentOption === 0 ? null : percentOption;
 
     const updated = await updateTradeDiscount({
@@ -609,6 +665,7 @@ async function handleDiscountSubcommand(params: {
 
     let missingAnnouncementMetadata = false;
     let announcementPatchError: Error | null = null;
+    let threadUpdateError: Error | null = null;
 
     if (!config.allowOffline) {
         if (updated.announcement_channel_id && updated.announcement_message_id) {
@@ -630,6 +687,8 @@ async function handleDiscountSubcommand(params: {
         }
     }
 
+    threadUpdateError = await syncSellForumThread({ config, tradeConfig, trade: updated });
+
     const originalPrice = numberFormatter.format(updated.auec);
     const discountedPrice =
         updated.discounted_auec !== null ? numberFormatter.format(updated.discounted_auec) : null;
@@ -646,6 +705,7 @@ async function handleDiscountSubcommand(params: {
         config.allowOffline ? "Offline mode: announcement was not updated." : undefined,
         missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
         announcementPatchError ? "Warning: Failed to update the trade announcement." : undefined,
+        threadUpdateError ? "Warning: Failed to update the trade forum thread." : undefined,
     ].filter(Boolean);
 
     return buildReply(lines.join("\n"));
@@ -669,6 +729,7 @@ async function handleDoneAllSubcommand(params: {
         return buildReply("You have no open trades to update.");
     }
 
+    const tradeConfig = await getTradeConfig(guildId);
     const storedUser = await getUserById(user.id);
     const userTag = resolveUserTag({
         userRecord: storedUser,
@@ -680,6 +741,7 @@ async function handleDoneAllSubcommand(params: {
     const patchFailures: number[] = [];
     const metadataFailures: number[] = [];
     const updateFailures: number[] = [];
+    const threadUpdateFailures: number[] = [];
     let missingAnnouncementCount = 0;
 
     for (const trade of openTrades) {
@@ -695,6 +757,11 @@ async function handleDoneAllSubcommand(params: {
         }
 
         updatedTradeIds.push(updated.id);
+
+        const threadError = await syncSellForumThread({ config, tradeConfig, trade: updated });
+        if (threadError) {
+            threadUpdateFailures.push(updated.id);
+        }
 
         if (config.allowOffline) {
             if (updated.status !== "open") {
@@ -784,6 +851,9 @@ async function handleDoneAllSubcommand(params: {
             ? `Warning: Failed to update stored control metadata for ${metadataFailures
                   .map((id) => `#${id}`)
                   .join(", ")}.`
+            : undefined,
+        threadUpdateFailures.length > 0
+            ? `Warning: Failed to update forum threads for ${threadUpdateFailures.map((id) => `#${id}`).join(", ")}.`
             : undefined,
     ].filter(Boolean);
 

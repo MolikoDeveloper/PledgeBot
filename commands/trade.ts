@@ -7,7 +7,10 @@ import {
 import {
     trade_status,
     getTradeById,
+    getTradeConfig,
+    getUserById,
     listTrades,
+    updateTradeAnnouncementMetadata,
     updateTradeStatus,
 } from "../src/database";
 import { ensureAdminAccess } from "../src/permissions";
@@ -15,10 +18,22 @@ import { ApplicationCommandOptionType } from "./types";
 import type {
     ChatInputCommandInteraction,
     CommandData,
+    CommandExecuteContext,
     CommandModule,
     CommandResponse,
     InteractionDataOption,
 } from "./types";
+import {
+    buildAnnouncementUrl,
+    buildSellThreadName,
+    buildTradeAnnouncementContent,
+    buildTradeEmbed,
+    patchTradeAnnouncement,
+    resolveForumThreadId,
+    resolveUserTag,
+    shouldArchiveSellThread,
+    updateForumThread,
+} from "./trade-utils";
 
 const statusChoices = trade_status.map((value) => ({ name: value, value }));
 
@@ -151,7 +166,13 @@ async function handleHistory(interaction: ChatInputCommandInteraction, lookup: O
     return buildReply(lines.join("\n"));
 }
 
-async function handleCancel(interaction: ChatInputCommandInteraction, lookup: OptionLookup) {
+async function handleCancel(params: {
+    interaction: ChatInputCommandInteraction;
+    lookup: OptionLookup;
+    config: CommandExecuteContext["config"];
+}): Promise<CommandResponse> {
+    const { interaction, lookup, config } = params;
+
     if (!interaction.guild_id) {
         return buildReply("This command can only be used in a guild.");
     }
@@ -172,14 +193,107 @@ async function handleCancel(interaction: ChatInputCommandInteraction, lookup: Op
         return buildReply(`Trade #${tradeId} is already cancelled.`);
     }
 
-    await updateTradeStatus({ tradeId, status: "cancelled", reason });
-    return buildReply(`Trade #${tradeId} has been cancelled.`);
+    const updated = await updateTradeStatus({ tradeId, status: "cancelled", reason });
+    if (!updated) {
+        return buildReply("Failed to update the trade status. Try again in a moment.");
+    }
+
+    let metadataError: Error | null = null;
+    try {
+        await updateTradeAnnouncementMetadata({
+            tradeId: updated.id,
+            doneOneButtonId: null,
+            doneAllButtonId: null,
+            cancelButtonId: null,
+        });
+    } catch (error) {
+        metadataError = error instanceof Error
+            ? error
+            : new Error("Unknown error while clearing control metadata.");
+        console.error(`Failed to clear trade control metadata for trade #${updated.id}`, error);
+    }
+
+    const storedUser = await getUserById(updated.user_id);
+    const userTag = resolveUserTag({
+        userRecord: storedUser,
+        fallbackId: updated.user_id,
+    });
+
+    const embed = buildTradeEmbed({ trade: updated, userTag, statusLabel: "Cancelled" });
+    const announcementContent = buildTradeAnnouncementContent({
+        trade: updated,
+        userId: updated.user_id,
+    });
+    const announcementUrl = buildAnnouncementUrl({
+        guildId: interaction.guild_id,
+        channelId: updated.announcement_channel_id,
+        messageId: updated.announcement_message_id,
+    });
+
+    let announcementPatchError: Error | null = null;
+    let missingAnnouncementMetadata = false;
+    let threadUpdateError: Error | null = null;
+
+    if (!config.allowOffline) {
+        if (updated.announcement_channel_id && updated.announcement_message_id) {
+            try {
+                await patchTradeAnnouncement({
+                    token: config.botToken,
+                    channelId: updated.announcement_channel_id,
+                    messageId: updated.announcement_message_id,
+                    embed,
+                    content: announcementContent,
+                    components: [],
+                });
+            } catch (error) {
+                announcementPatchError =
+                    error instanceof Error ? error : new Error("Unknown announcement update failure.");
+                console.error(`Failed to patch trade announcement for trade #${updated.id}`, error);
+            }
+        } else {
+            missingAnnouncementMetadata = true;
+        }
+
+        const tradeConfig = await getTradeConfig(interaction.guild_id);
+        const threadId = resolveForumThreadId({
+            announcementChannelId: updated.announcement_channel_id,
+            tradeChannelId: tradeConfig.tradeChannelId,
+            tradeChannelType: tradeConfig.tradeChannelType,
+        });
+
+        if (threadId) {
+            try {
+                await updateForumThread({
+                    token: config.botToken,
+                    threadId,
+                    name: buildSellThreadName(updated),
+                    ...(shouldArchiveSellThread(updated.status) ? { archived: true, locked: true } : {}),
+                });
+            } catch (error) {
+                threadUpdateError =
+                    error instanceof Error ? error : new Error("Unknown forum thread update failure.");
+                console.error(`Failed to update forum thread for trade #${updated.id}`, error);
+            }
+        }
+    }
+
+    const responseLines = [
+        `Trade #${updated.id} has been cancelled.`,
+        announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
+        config.allowOffline ? "Offline mode: announcement was not updated." : undefined,
+        missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
+        announcementPatchError ? "Warning: Failed to update the trade announcement." : undefined,
+        metadataError ? "Warning: Failed to update stored control metadata." : undefined,
+        threadUpdateError ? "Warning: Failed to update the trade forum thread." : undefined,
+    ].filter(Boolean);
+
+    return buildReply(responseLines.join("\n"));
 }
 
 const tradeCommand: CommandModule = {
     data,
     requiresAdmin: true,
-    async execute({ interaction }) {
+    async execute({ interaction, config }) {
         if (interaction.type !== InteractionType.APPLICATION_COMMAND) {
             return buildReply("Unsupported interaction type.");
         }
@@ -197,7 +311,7 @@ const tradeCommand: CommandModule = {
         }
 
         if (name === "cancel") {
-            return handleCancel(interaction, lookup);
+            return handleCancel({ interaction, lookup, config });
         }
 
         return buildReply("Unsupported subcommand.");

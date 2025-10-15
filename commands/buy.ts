@@ -23,6 +23,7 @@ import {
     buildAnnouncementUrl,
     buildBuyOrderAnnouncementContent,
     buildBuyOrderEmbed,
+    buildBuyThreadName,
     deliverTradeAnnouncement,
     resolveUserTag,
     type AnnouncementResult,
@@ -178,7 +179,7 @@ const buyCommand: CommandModule = {
             userTag,
         });
         const content = buildBuyOrderAnnouncementContent({ order, userId: user.id });
-        const threadName = `Buy: ${order.item} (#${order.id})`;
+        const threadName = buildBuyThreadName(order);
 
         let announcementUrl: string | null = null;
         let announcementError: Error | null = null;
@@ -188,6 +189,10 @@ const buyCommand: CommandModule = {
 
         if (!config.allowOffline) {
             try {
+                const appliedTags =
+                    tradeConfig.tradeChannelType === "forum" && tradeConfig.buyForumTagId
+                        ? [tradeConfig.buyForumTagId]
+                        : undefined;
                 const result: AnnouncementResult = await deliverTradeAnnouncement({
                     token: config.botToken,
                     guildId,
@@ -197,6 +202,7 @@ const buyCommand: CommandModule = {
                     threadName,
                     embed,
                     userId: user.id,
+                    appliedTags,
                 });
                 announcementUrl = result.url;
 

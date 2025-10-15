@@ -2,6 +2,7 @@ import { InteractionResponseFlags, InteractionResponseType } from "discord-inter
 
 import {
     getTradeById,
+    getTradeConfig,
     getUserById,
     reduceTradeStock,
     updateTradeAnnouncementMetadata,
@@ -11,11 +12,15 @@ import {
 import type { AppConfig } from "../src/config";
 import {
     buildAnnouncementUrl,
+    buildSellThreadName,
     buildTradeAnnouncementContent,
     buildTradeEmbed,
     patchTradeAnnouncement,
+    resolveForumThreadId,
     resolveStatusLabel,
     resolveUserTag,
+    shouldArchiveSellThread,
+    updateForumThread,
 } from "./trade-utils";
 import type { CommandResponse, MessageComponent, MessageComponentInteraction } from "./types";
 import { ButtonStyle, ComponentType } from "./types";
@@ -95,12 +100,13 @@ function buildActiveComponents(trade: TradeRecord): MessageComponent[] {
 async function handleDoneAction(params: {
     interaction: MessageComponentInteraction;
     config: AppConfig;
+    tradeConfig: Awaited<ReturnType<typeof getTradeConfig>>;
     trade: Awaited<ReturnType<typeof getTradeById>>;
     customId: string;
     userId: string;
     mode: "one" | "all";
 }): Promise<CommandResponse> {
-    const { interaction, config, trade, customId, userId, mode } = params;
+    const { interaction, config, tradeConfig, trade, customId, userId, mode } = params;
 
     if (!trade) {
         return buildEphemeralResponse("Trade not found.");
@@ -153,6 +159,7 @@ async function handleDoneAction(params: {
 
     let announcementPatchError: Error | null = null;
     let missingAnnouncementMetadata = false;
+    let threadUpdateError: Error | null = null;
 
     if (!config.allowOffline) {
         if (updated.announcement_channel_id && updated.announcement_message_id) {
@@ -182,6 +189,29 @@ async function handleDoneAction(params: {
         }
     }
 
+    if (!config.allowOffline) {
+        const threadId = resolveForumThreadId({
+            announcementChannelId: updated.announcement_channel_id,
+            tradeChannelId: tradeConfig.tradeChannelId,
+            tradeChannelType: tradeConfig.tradeChannelType,
+        });
+
+        if (threadId) {
+            try {
+                await updateForumThread({
+                    token: config.botToken,
+                    threadId,
+                    name: buildSellThreadName(updated),
+                    ...(shouldArchiveSellThread(updated.status) ? { archived: true, locked: true } : {}),
+                });
+            } catch (error) {
+                threadUpdateError =
+                    error instanceof Error ? error : new Error("Unknown forum thread update failure.");
+                console.error(`Failed to update forum thread for trade #${trade.id}`, error);
+            }
+        }
+    }
+
     const amountText = amount === 1 ? "1 item" : `${amount} items`;
     const responseLines = [
         `Marked ${amountText} as done for trade #${updated.id}.`,
@@ -191,6 +221,7 @@ async function handleDoneAction(params: {
         missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
         announcementPatchError ? "Warning: Failed to update the trade announcement." : undefined,
         metadataError ? "Warning: Failed to update stored control metadata." : undefined,
+        threadUpdateError ? "Warning: Failed to update the trade forum thread." : undefined,
     ].filter(Boolean);
 
     return buildEphemeralResponse(responseLines.join("\n"));
@@ -199,11 +230,12 @@ async function handleDoneAction(params: {
 async function handleCancelAction(params: {
     interaction: MessageComponentInteraction;
     config: AppConfig;
+    tradeConfig: Awaited<ReturnType<typeof getTradeConfig>>;
     trade: Awaited<ReturnType<typeof getTradeById>>;
     customId: string;
     userId: string;
 }): Promise<CommandResponse> {
-    const { interaction, config, trade, customId, userId } = params;
+    const { interaction, config, tradeConfig, trade, customId, userId } = params;
 
     if (!trade) {
         return buildEphemeralResponse("Trade not found.");
@@ -244,6 +276,7 @@ async function handleCancelAction(params: {
 
     let announcementPatchError: Error | null = null;
     let missingAnnouncementMetadata = false;
+    let threadUpdateError: Error | null = null;
 
     if (!config.allowOffline) {
         if (updated.announcement_channel_id && updated.announcement_message_id) {
@@ -276,6 +309,29 @@ async function handleCancelAction(params: {
         }
     }
 
+    if (!config.allowOffline) {
+        const threadId = resolveForumThreadId({
+            announcementChannelId: updated.announcement_channel_id,
+            tradeChannelId: tradeConfig.tradeChannelId,
+            tradeChannelType: tradeConfig.tradeChannelType,
+        });
+
+        if (threadId) {
+            try {
+                await updateForumThread({
+                    token: config.botToken,
+                    threadId,
+                    name: buildSellThreadName(updated),
+                    ...(shouldArchiveSellThread(updated.status) ? { archived: true, locked: true } : {}),
+                });
+            } catch (error) {
+                threadUpdateError =
+                    error instanceof Error ? error : new Error("Unknown forum thread update failure.");
+                console.error(`Failed to update forum thread for trade #${trade.id}`, error);
+            }
+        }
+    }
+
     const responseLines = [
         `Trade #${updated.id} has been cancelled.`,
         announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
@@ -283,6 +339,7 @@ async function handleCancelAction(params: {
         missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
         announcementPatchError ? "Warning: Failed to update the trade announcement." : undefined,
         metadataError ? "Warning: Failed to update stored control metadata." : undefined,
+        threadUpdateError ? "Warning: Failed to update the trade forum thread." : undefined,
     ].filter(Boolean);
 
     return buildEphemeralResponse(responseLines.join("\n"));
@@ -329,11 +386,14 @@ export async function handleTradeComponent(params: {
         return buildEphemeralResponse("Only the seller can manage this trade.");
     }
 
+    const tradeConfig = await getTradeConfig(interaction.guild_id);
+
     if (action === "done") {
         const mode: "one" | "all" = scope === "all" ? "all" : "one";
         return handleDoneAction({
             interaction,
             config,
+            tradeConfig,
             trade,
             customId: interaction.data.custom_id,
             userId,
@@ -342,7 +402,14 @@ export async function handleTradeComponent(params: {
     }
 
     if (action === "cancel") {
-        return handleCancelAction({ interaction, config, trade, customId: interaction.data.custom_id, userId });
+        return handleCancelAction({
+            interaction,
+            config,
+            tradeConfig,
+            trade,
+            customId: interaction.data.custom_id,
+            userId,
+        });
     }
 
     return buildEphemeralResponse("Unsupported trade component action.");

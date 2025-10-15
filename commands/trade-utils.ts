@@ -2,12 +2,17 @@ import type { BuyOrderRecord, TradeRecord, TradeStatus, UserRecord } from "../sr
 import type { MessageComponent } from "./types";
 
 const numberFormatter = new Intl.NumberFormat("en-US");
+const AUEC_EMOJI = "aUEC";
 
 export type AnnouncementResult = {
     url: string | null;
     messageId: string | null;
     messageChannelId: string | null;
 };
+
+export function formatAuecWithEmoji(amount: number): string {
+    return `${numberFormatter.format(amount)} ${AUEC_EMOJI}`;
+}
 
 export function resolveStatusLabel(status: TradeStatus): string {
     switch (status) {
@@ -123,6 +128,27 @@ export function buildTradeAnnouncementContent(params: {
     return `${base} — ${numberFormatter.format(params.trade.auec)} aUEC`;
 }
 
+export function buildSellThreadName(trade: TradeRecord): string {
+    const price = trade.discounted_auec ?? trade.auec;
+    const baseName = `Sell: ${trade.title} - ${formatAuecWithEmoji(price)}`;
+
+    if (trade.status === "selled" || trade.status === "complete") {
+        const statusLabel = resolveStatusLabel(trade.status);
+        return `✅ ${baseName} (${statusLabel})`;
+    }
+
+    if (trade.status !== "open") {
+        const statusLabel = resolveStatusLabel(trade.status);
+        return `${baseName} (${statusLabel})`;
+    }
+
+    return baseName;
+}
+
+export function buildBuyThreadName(order: Pick<BuyOrderRecord, "item" | "price">): string {
+    return `Buy: ${order.item} - ${formatAuecWithEmoji(order.price)}`;
+}
+
 export function buildBuyOrderEmbed(params: {
     order: BuyOrderRecord;
     userTag: string;
@@ -178,6 +204,70 @@ export function buildAnnouncementUrl(params: {
     return `https://discord.com/channels/${params.guildId}/${params.channelId}/${params.messageId}`;
 }
 
+export function resolveForumThreadId(params: {
+    announcementChannelId: string | null;
+    tradeChannelId: string | null;
+    tradeChannelType: "forum" | "text" | null;
+}): string | null {
+    if (!params.announcementChannelId) {
+        return null;
+    }
+
+    if (params.tradeChannelType !== "forum") {
+        return null;
+    }
+
+    if (params.tradeChannelId && params.announcementChannelId === params.tradeChannelId) {
+        return null;
+    }
+
+    return params.announcementChannelId;
+}
+
+export function shouldArchiveSellThread(status: TradeStatus): boolean {
+    return status === "selled" || status === "complete" || status === "cancelled";
+}
+
+export async function updateForumThread(params: {
+    token: string;
+    threadId: string;
+    name?: string;
+    archived?: boolean;
+    locked?: boolean;
+}): Promise<void> {
+    const payload: Record<string, unknown> = {};
+
+    if (typeof params.name === "string") {
+        payload.name = params.name;
+    }
+
+    if (typeof params.archived === "boolean") {
+        payload.archived = params.archived;
+    }
+
+    if (typeof params.locked === "boolean") {
+        payload.locked = params.locked;
+    }
+
+    if (Object.keys(payload).length === 0) {
+        return;
+    }
+
+    const response = await fetch(`https://discord.com/api/v10/channels/${params.threadId}`, {
+        method: "PATCH",
+        headers: {
+            Authorization: `Bot ${params.token}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+        const message = await response.text();
+        throw new Error(`Failed to update forum thread: ${response.status} ${message}`);
+    }
+}
+
 export async function patchTradeAnnouncement(params: {
     token: string;
     channelId: string;
@@ -222,6 +312,7 @@ export async function deliverTradeAnnouncement(params: {
     threadName: string;
     embed: Record<string, unknown>;
     userId: string;
+    appliedTags?: string[];
 }): Promise<AnnouncementResult> {
     const baseHeaders = {
         Authorization: `Bot ${params.token}`,
@@ -258,33 +349,89 @@ export async function deliverTradeAnnouncement(params: {
         };
     }
 
-    const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/threads`, {
-        method: "POST",
-        headers: baseHeaders,
-        body: JSON.stringify({
+    const buildThreadPayload = (appliedTags?: string[]): Record<string, unknown> => {
+        const payload: Record<string, unknown> = {
             name: params.threadName,
             message: {
                 content: params.content,
                 embeds: [params.embed],
                 allowed_mentions: allowedMentions,
             },
-        }),
-    });
+        };
 
-    if (!response.ok) {
+        if (appliedTags && appliedTags.length > 0) {
+            payload.applied_tags = appliedTags;
+        }
+
+        return payload;
+    };
+
+    let appliedTags = params.appliedTags;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/threads`, {
+            method: "POST",
+            headers: baseHeaders,
+            body: JSON.stringify(buildThreadPayload(appliedTags)),
+        });
+
+        if (response.ok) {
+            const threadData = (await response.json()) as {
+                id?: string | null;
+                message?: { id?: string | null } | null;
+            };
+            const threadId = threadData.id ?? null;
+            const starterMessageId = threadData.message?.id ?? null;
+            return {
+                url: threadId ? `https://discord.com/channels/${params.guildId}/${threadId}` : null,
+                messageId: starterMessageId,
+                messageChannelId: starterMessageId && threadId ? threadId : null,
+            };
+        }
+
         const message = await response.text();
-        throw new Error(`Failed to create forum thread: ${response.status} ${message}`);
+
+        let errorCode: number | undefined;
+        try {
+            const errorPayload = JSON.parse(message) as { code?: number };
+            errorCode = errorPayload?.code;
+        } catch {
+            // Ignore parse errors; we'll rethrow with the original message below.
+        }
+
+        const missingRequiredTag =
+            response.status === 400 && errorCode === 40067 && (!appliedTags || appliedTags.length === 0);
+
+        if (!missingRequiredTag || attempt === 1) {
+            throw new Error(`Failed to create forum thread: ${response.status} ${message}`);
+        }
+
+        const forumResponse = await fetch(`https://discord.com/api/v10/channels/${params.channelId}`, {
+            method: "GET",
+            headers: baseHeaders,
+        });
+
+        if (!forumResponse.ok) {
+            const forumMessage = await forumResponse.text();
+            throw new Error(
+                `Failed to load forum channel details: ${forumResponse.status} ${forumMessage}; original error: ${response.status} ${message}`,
+            );
+        }
+
+        const forumData = (await forumResponse.json()) as {
+            available_tags?: Array<{ id?: string | null }>;
+        };
+
+        const fallbackTag = forumData.available_tags?.find((tag) => typeof tag?.id === "string")?.id ?? null;
+
+        if (!fallbackTag) {
+            throw new Error(
+                `Forum channel requires a tag but none are configured; original error: ${response.status} ${message}`,
+            );
+        }
+
+        appliedTags = [fallbackTag];
     }
 
-    const threadData = (await response.json()) as {
-        id?: string | null;
-        message?: { id?: string | null } | null;
-    };
-    const threadId = threadData.id ?? null;
-    const starterMessageId = threadData.message?.id ?? null;
-    return {
-        url: threadId ? `https://discord.com/channels/${params.guildId}/${threadId}` : null,
-        messageId: starterMessageId,
-        messageChannelId: starterMessageId && threadId ? threadId : null,
-    };
+    throw new Error("Failed to create forum thread: unknown error");
 }

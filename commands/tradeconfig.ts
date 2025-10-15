@@ -5,9 +5,11 @@ import {
 
 import {
     addTradeRole,
+    getTradeConfig,
     listTradeRoles,
     removeTradeRole,
     setTradeChannel,
+    updateTradeForumTags,
 } from "../src/database";
 import { ensureAdminAccess } from "../src/permissions";
 import {
@@ -83,6 +85,37 @@ const commandData: CommandData = {
                     type: ApplicationCommandOptionType.SUB_COMMAND,
                     name: "list",
                     description: "Show the roles that can moderate trades.",
+                },
+            ],
+        },
+        {
+            type: ApplicationCommandOptionType.SUB_COMMAND_GROUP,
+            name: "forumtags",
+            description: "Configure forum tags applied to trade announcements.",
+            options: [
+                {
+                    type: ApplicationCommandOptionType.SUB_COMMAND,
+                    name: "sell",
+                    description: "Set or clear the forum tag used for sell announcements.",
+                    options: [
+                        {
+                            type: ApplicationCommandOptionType.STRING,
+                            name: "tag_id",
+                            description: "Forum tag snowflake to apply (omit to clear).",
+                        },
+                    ],
+                },
+                {
+                    type: ApplicationCommandOptionType.SUB_COMMAND,
+                    name: "buy",
+                    description: "Set or clear the forum tag used for buy announcements.",
+                    options: [
+                        {
+                            type: ApplicationCommandOptionType.STRING,
+                            name: "tag_id",
+                            description: "Forum tag snowflake to apply (omit to clear).",
+                        },
+                    ],
                 },
             ],
         },
@@ -258,6 +291,48 @@ async function handleRoles(params: {
     }
 }
 
+async function handleForumTags(params: {
+    interaction: CommandExecuteContext["interaction"];
+}): Promise<CommandResponse> {
+    const { interaction } = params;
+
+    if (!interaction.guild_id) {
+        return buildReply("This command can only be used in a guild.");
+    }
+
+    const resolution = extractSubcommand(interaction);
+    if (resolution.group !== "forumtags" || !resolution.subcommand) {
+        return buildReply("Unsupported subcommand.");
+    }
+
+    const lookup = normalizeOptions(resolution.options);
+    const guildId = interaction.guild_id;
+    const tagIdRaw = getStringOption(lookup, "tag_id");
+    const tagId = tagIdRaw && tagIdRaw.trim().length > 0 ? tagIdRaw.trim() : null;
+
+    const tradeConfig = await getTradeConfig(guildId);
+    if (tradeConfig.tradeChannelType !== "forum" || !tradeConfig.tradeChannelId) {
+        return buildReply("Configure a forum trade channel before setting forum tags.");
+    }
+
+    switch (resolution.subcommand) {
+        case "sell": {
+            await updateTradeForumTags({ guildId, sellForumTagId: tagId });
+            return tagId
+                ? buildReply(`Sell announcements will use forum tag ${tagId}.`)
+                : buildReply("Sell announcement forum tag cleared.");
+        }
+        case "buy": {
+            await updateTradeForumTags({ guildId, buyForumTagId: tagId });
+            return tagId
+                ? buildReply(`Buy announcements will use forum tag ${tagId}.`)
+                : buildReply("Buy announcement forum tag cleared.");
+        }
+        default:
+            return buildReply("Unsupported subcommand.");
+    }
+}
+
 const tradeConfigCommand: CommandModule = {
     data: commandData,
     requiresAdmin: true,
@@ -275,6 +350,10 @@ const tradeConfigCommand: CommandModule = {
 
         if (resolution.group === "roles") {
             return handleRoles({ interaction });
+        }
+
+        if (resolution.group === "forumtags") {
+            return handleForumTags({ interaction });
         }
 
         if (resolution.subcommand === "channel") {
