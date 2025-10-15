@@ -9,10 +9,11 @@ import {
     getTradeConfig,
     getUserById,
     listTradesByUser,
+    reduceTradeStock,
     recordGuild,
     recordUser,
     updateTradeAnnouncementMetadata,
-    updateTradeStatus,
+    type TradeRecord,
 } from "../src/database";
 import {
     ApplicationCommandOptionType,
@@ -73,14 +74,20 @@ const commandData: CommandData = {
         },
         {
             type: ApplicationCommandOptionType.SUB_COMMAND,
-            name: "close",
-            description: "Close a trade or all your open trades.",
+            name: "done",
+            description: "Mark trade units as sold or mark all trades as sold.",
             options: [
                 {
                     type: ApplicationCommandOptionType.STRING,
                     name: "target",
-                    description: "Trade ID to close or 'all' to close every open trade you created.",
+                    description: "Trade ID to mark as done or 'todos' to mark every open trade you created.",
                     required: true,
+                },
+                {
+                    type: ApplicationCommandOptionType.INTEGER,
+                    name: "amount",
+                    description: "Units sold (default: 1)",
+                    min_value: 1,
                 },
             ],
         },
@@ -95,7 +102,7 @@ type AnnouncementResult = {
     messageChannelId: string | null;
 };
 
-type SubcommandName = "create" | "close";
+type SubcommandName = "create" | "done";
 
 type ExtractedSubcommand = {
     name: SubcommandName | null;
@@ -139,28 +146,63 @@ function extractSubcommand(interaction: CommandExecuteContext["interaction"]): E
 }
 
 function buildControlComponents(params: {
-    closeCustomId: string;
+    stock: number;
+    doneOneCustomId: string;
+    doneAllCustomId: string | null;
     cancelCustomId: string;
 }): MessageComponent[] {
+    if (params.stock <= 0) {
+        return [];
+    }
+
+    const buttons: MessageComponent["components"] = [
+        {
+            type: ComponentType.BUTTON,
+            style: ButtonStyle.SUCCESS,
+            label: "Done 1 item",
+            custom_id: params.doneOneCustomId,
+        },
+    ];
+
+    if (params.stock > 1 && params.doneAllCustomId) {
+        buttons.push({
+            type: ComponentType.BUTTON,
+            style: ButtonStyle.PRIMARY,
+            label: "Done all",
+            custom_id: params.doneAllCustomId,
+        });
+    }
+
+    buttons.push({
+        type: ComponentType.BUTTON,
+        style: ButtonStyle.DANGER,
+        label: "Cancel",
+        custom_id: params.cancelCustomId,
+    });
+
     return [
         {
             type: ComponentType.ACTION_ROW,
-            components: [
-                {
-                    type: ComponentType.BUTTON,
-                    style: ButtonStyle.SUCCESS,
-                    label: "Close",
-                    custom_id: params.closeCustomId,
-                },
-                {
-                    type: ComponentType.BUTTON,
-                    style: ButtonStyle.DANGER,
-                    label: "Cancel",
-                    custom_id: params.cancelCustomId,
-                },
-            ],
+            components: buttons,
         },
     ];
+}
+
+function resolveTradeComponents(trade: TradeRecord): MessageComponent[] {
+    if (trade.status !== "open" || trade.stock <= 0) {
+        return [];
+    }
+
+    if (!trade.done_one_button_custom_id || !trade.cancel_button_custom_id) {
+        return [];
+    }
+
+    return buildControlComponents({
+        stock: trade.stock,
+        doneOneCustomId: trade.done_one_button_custom_id,
+        doneAllCustomId: trade.done_all_button_custom_id,
+        cancelCustomId: trade.cancel_button_custom_id,
+    });
 }
 
 function getStringOption(lookup: OptionLookup, name: string): string | null {
@@ -314,15 +356,22 @@ async function handleCreateSubcommand(params: {
         imageUrl,
     });
 
-    const closeCustomId = `trade:${trade.id}:close`;
+    const doneOneCustomId = `trade:${trade.id}:done:one`;
+    const doneAllCustomId = trade.stock > 1 ? `trade:${trade.id}:done:all` : null;
     const cancelCustomId = `trade:${trade.id}:cancel`;
-    const replyComponents = buildControlComponents({ closeCustomId, cancelCustomId });
+    const replyComponents = buildControlComponents({
+        stock: trade.stock,
+        doneOneCustomId,
+        doneAllCustomId,
+        cancelCustomId,
+    });
 
     let controlMetadataError: Error | null = null;
     try {
         await updateTradeAnnouncementMetadata({
             tradeId: trade.id,
-            closeButtonId: closeCustomId,
+            doneOneButtonId: doneOneCustomId,
+            doneAllButtonId: doneAllCustomId,
             cancelButtonId: cancelCustomId,
         });
     } catch (error) {
@@ -415,7 +464,7 @@ async function handleCreateSubcommand(params: {
     return buildReply(confirmationLines.join("\n"), replyComponents);
 }
 
-async function handleCloseSubcommand(params: {
+async function handleDoneSubcommand(params: {
     interaction: CommandExecuteContext["interaction"];
     config: CommandExecuteContext["config"];
     options: InteractionDataOption[];
@@ -424,51 +473,54 @@ async function handleCloseSubcommand(params: {
     const { interaction, config, options, user } = params;
     const lookup = normalizeOptions(options);
     const targetRaw = getStringOption(lookup, "target");
+    const amountOption = getIntegerOption(lookup, "amount");
 
     if (!targetRaw) {
-        return buildReply("Provide the trade ID to close or 'all' to close all open trades.");
+        return buildReply("Provide the trade ID to mark as done or 'todos' to update all open trades.");
+    }
+
+    if (amountOption !== null && (!Number.isInteger(amountOption) || amountOption <= 0)) {
+        return buildReply("Provide a valid amount of units to mark as done (minimum 1).");
     }
 
     const normalizedTarget = targetRaw.trim().toLowerCase();
 
-    if (normalizedTarget === "all") {
-        return handleCloseAllSubcommand({ interaction, config, user });
+    if (normalizedTarget === "todos" || normalizedTarget === "all") {
+        if (amountOption !== null) {
+            return buildReply("The amount option cannot be used when marking all trades.");
+        }
+        return handleDoneAllSubcommand({ interaction, config, user });
     }
 
     const tradeId = Number(targetRaw);
     if (!Number.isInteger(tradeId) || tradeId <= 0) {
-        return buildReply("Provide a valid trade ID or 'all'.");
+        return buildReply("Provide a valid trade ID or 'todos'.");
     }
 
-    return handleCloseSingleSubcommand({ interaction, config, user, tradeId });
-}
-
-async function handleCloseSingleSubcommand(params: {
-    interaction: CommandExecuteContext["interaction"];
-    config: CommandExecuteContext["config"];
-    user: InteractionUser;
-    tradeId: number;
-}): Promise<CommandResponse> {
-    const { interaction, config, user, tradeId } = params;
-    const guildId = interaction.guild_id!;
-
-    const existing = await getTradeById(tradeId);
-    if (!existing || existing.guild_id !== guildId) {
+    const amount = amountOption ?? 1;
+    const trade = await getTradeById(tradeId);
+    if (!trade || trade.guild_id !== interaction.guild_id) {
         return buildReply(`Trade #${tradeId} does not exist for this guild.`);
     }
 
-    if (existing.user_id !== user.id) {
-        return buildReply("You can only close your own trades.");
+    if (trade.user_id !== user.id) {
+        return buildReply("You can only manage your own trades.");
     }
 
-    if (existing.status !== "open") {
-        const statusLabel = resolveStatusLabel(existing.status);
-        return buildReply(`Trade #${tradeId} is already ${statusLabel}.`);
+    if (trade.status !== "open") {
+        const statusLabel = resolveStatusLabel(trade.status);
+        return buildReply(`Trade #${trade.id} is already ${statusLabel}.`);
     }
 
-    const updated = await updateTradeStatus({ tradeId, status: "complete" });
+    if (trade.stock <= 0) {
+        return buildReply(`Trade #${trade.id} has no remaining stock.`);
+    }
+
+    const updated = await reduceTradeStock({ tradeId: trade.id, amount });
     if (!updated) {
-        return buildReply("Failed to update the trade status. Try again in a moment.");
+        return buildReply(
+            `Unable to mark ${amount === 1 ? "1 item" : `${amount} items`} as done for trade #${trade.id}. Check the available stock and try again.`,
+        );
     }
 
     const storedUser = await getUserById(user.id);
@@ -478,11 +530,30 @@ async function handleCloseSingleSubcommand(params: {
         fallbackId: user.id,
     });
 
+    const embed = buildTradeEmbed({ trade: updated, userTag });
     const announcementUrl = buildAnnouncementUrl({
-        guildId,
+        guildId: interaction.guild_id!,
         channelId: updated.announcement_channel_id,
         messageId: updated.announcement_message_id,
     });
+    const replyComponents = resolveTradeComponents(updated);
+
+    let metadataError: Error | null = null;
+    if (updated.status !== "open") {
+        try {
+            await updateTradeAnnouncementMetadata({
+                tradeId: updated.id,
+                doneOneButtonId: null,
+                doneAllButtonId: null,
+                cancelButtonId: null,
+            });
+        } catch (error) {
+            metadataError = error instanceof Error
+                ? error
+                : new Error("Unknown error while clearing control metadata.");
+            console.error("Failed to clear trade control metadata", error);
+        }
+    }
 
     let announcementPatchError: Error | null = null;
     let missingAnnouncementMetadata = false;
@@ -490,42 +561,38 @@ async function handleCloseSingleSubcommand(params: {
     if (!config.allowOffline) {
         if (updated.announcement_channel_id && updated.announcement_message_id) {
             try {
-                const embed = buildTradeEmbed({
-                    trade: updated,
-                    userTag,
-                    statusLabel: "Closed",
-                });
-
                 await patchTradeAnnouncement({
                     token: config.botToken,
                     channelId: updated.announcement_channel_id,
                     messageId: updated.announcement_message_id,
                     embed,
-                    components: [],
+                    components: updated.status === "open" ? replyComponents : [],
                 });
             } catch (error) {
-                announcementPatchError = error instanceof Error
-                    ? error
-                    : new Error("Unknown error while updating the trade announcement.");
-                console.error(`Failed to patch trade announcement for trade #${tradeId}`, error);
+                announcementPatchError =
+                    error instanceof Error ? error : new Error("Unknown announcement update failure.");
+                console.error(`Failed to patch trade announcement for trade #${trade.id}`, error);
             }
         } else {
             missingAnnouncementMetadata = true;
         }
     }
 
+    const amountText = amount === 1 ? "1 item" : `${amount} items`;
     const responseLines = [
-        `Trade #${updated.id} marked as closed.`,
+        `Marked ${amountText} as done for trade #${updated.id}.`,
+        updated.status === "open" ? `Remaining stock: ${updated.stock}.` : "Trade is now marked as sold out.",
         announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
         config.allowOffline ? "Offline mode: announcement was not updated." : undefined,
         missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
         announcementPatchError ? "Warning: Failed to update the trade announcement." : undefined,
+        metadataError ? "Warning: Failed to update stored control metadata." : undefined,
     ].filter(Boolean);
 
-    return buildReply(responseLines.join("\n"));
+    return buildReply(responseLines.join("\n"), replyComponents.length > 0 ? replyComponents : undefined);
 }
 
-async function handleCloseAllSubcommand(params: {
+async function handleDoneAllSubcommand(params: {
     interaction: CommandExecuteContext["interaction"];
     config: CommandExecuteContext["config"];
     user: InteractionUser;
@@ -540,7 +607,7 @@ async function handleCloseAllSubcommand(params: {
     });
 
     if (openTrades.length === 0) {
-        return buildReply("You have no open trades to close.");
+        return buildReply("You have no open trades to update.");
     }
 
     const storedUser = await getUserById(user.id);
@@ -550,58 +617,109 @@ async function handleCloseAllSubcommand(params: {
         fallbackId: user.id,
     });
 
-    const closedTradeIds: number[] = [];
+    const updatedTradeIds: number[] = [];
     const patchFailures: number[] = [];
+    const metadataFailures: number[] = [];
+    const updateFailures: number[] = [];
     let missingAnnouncementCount = 0;
 
     for (const trade of openTrades) {
-        const updated = await updateTradeStatus({ tradeId: trade.id, status: "complete" });
-        if (!updated) {
-            patchFailures.push(trade.id);
-            console.error(`Failed to update trade status for trade #${trade.id}`);
+        if (trade.stock <= 0) {
             continue;
         }
 
-        closedTradeIds.push(updated.id);
+        const updated = await reduceTradeStock({ tradeId: trade.id, amount: trade.stock });
+        if (!updated) {
+            updateFailures.push(trade.id);
+            console.error(`Failed to update trade stock for trade #${trade.id}`);
+            continue;
+        }
+
+        updatedTradeIds.push(updated.id);
 
         if (config.allowOffline) {
+            if (updated.status !== "open") {
+                try {
+                    await updateTradeAnnouncementMetadata({
+                        tradeId: updated.id,
+                        doneOneButtonId: null,
+                        doneAllButtonId: null,
+                        cancelButtonId: null,
+                    });
+                } catch (error) {
+                    metadataFailures.push(updated.id);
+                    console.error(`Failed to clear trade control metadata for trade #${updated.id}`, error);
+                }
+            }
             continue;
         }
 
         if (!updated.announcement_channel_id || !updated.announcement_message_id) {
             missingAnnouncementCount += 1;
+            if (updated.status !== "open") {
+                try {
+                    await updateTradeAnnouncementMetadata({
+                        tradeId: updated.id,
+                        doneOneButtonId: null,
+                        doneAllButtonId: null,
+                        cancelButtonId: null,
+                    });
+                } catch (error) {
+                    metadataFailures.push(updated.id);
+                    console.error(`Failed to clear trade control metadata for trade #${updated.id}`, error);
+                }
+            }
             continue;
         }
 
         try {
-            const embed = buildTradeEmbed({
-                trade: updated,
-                userTag,
-                statusLabel: "Closed",
-            });
+            const embed = buildTradeEmbed({ trade: updated, userTag });
+            const components = updated.status === "open" ? resolveTradeComponents(updated) : [];
 
             await patchTradeAnnouncement({
                 token: config.botToken,
                 channelId: updated.announcement_channel_id,
                 messageId: updated.announcement_message_id,
                 embed,
-                components: [],
+                components,
             });
         } catch (error) {
             patchFailures.push(updated.id);
             console.error(`Failed to patch trade announcement for trade #${updated.id}`, error);
         }
+
+        if (updated.status !== "open") {
+            try {
+                await updateTradeAnnouncementMetadata({
+                    tradeId: updated.id,
+                    doneOneButtonId: null,
+                    doneAllButtonId: null,
+                    cancelButtonId: null,
+                });
+            } catch (error) {
+                metadataFailures.push(updated.id);
+                console.error(`Failed to clear trade control metadata for trade #${updated.id}`, error);
+            }
+        }
     }
 
     const lines = [
-        `Closed ${closedTradeIds.length} trade${closedTradeIds.length === 1 ? "" : "s"}.`,
-        closedTradeIds.length ? `Trades: ${closedTradeIds.map((id) => `#${id}`).join(", ")}` : undefined,
+        `Updated ${updatedTradeIds.length} trade${updatedTradeIds.length === 1 ? "" : "s"}.`,
+        updatedTradeIds.length ? `Trades: ${updatedTradeIds.map((id) => `#${id}`).join(", ")}` : undefined,
         config.allowOffline ? "Offline mode: announcements were not updated." : undefined,
         !config.allowOffline && missingAnnouncementCount > 0
             ? `${missingAnnouncementCount} trade${missingAnnouncementCount === 1 ? "" : "s"} did not have announcement metadata stored.`
             : undefined,
+        updateFailures.length > 0
+            ? `Warning: Failed to update stock for ${updateFailures.map((id) => `#${id}`).join(", ")}.`
+            : undefined,
         patchFailures.length > 0
             ? `Warning: Failed to update announcements for ${patchFailures.map((id) => `#${id}`).join(", ")}.`
+            : undefined,
+        metadataFailures.length > 0
+            ? `Warning: Failed to update stored control metadata for ${metadataFailures
+                  .map((id) => `#${id}`)
+                  .join(", ")}.`
             : undefined,
     ].filter(Boolean);
 
@@ -631,8 +749,8 @@ const sellCommand: CommandModule = {
             });
         }
 
-        if (subcommandName === "close") {
-            return handleCloseSubcommand({
+        if (subcommandName === "done") {
+            return handleDoneSubcommand({
                 interaction,
                 config,
                 options,
