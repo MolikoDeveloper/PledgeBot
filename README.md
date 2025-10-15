@@ -1,5 +1,9 @@
 # Commands
 
+## General
+
+- `/help`
+
 ## Admin
 
 - `/tradeconfig channel channel:<#channel> type:<forum|text>`
@@ -24,3 +28,6 @@ If no tag is configured, announcements will post without any forum tags.
 ## User
 
 - `/sell title:<text> auec:<integer> stock?:<integer=1> image?:<attachment>`
+- `/buy item:<text> price:<integer> amount?:<integer> attachment?:<attachment>`
+- `/trade history page?:<number> status?:<open|matched|escrow|complete|cancelled|expired>`
+- `/trade cancel trade_id:<id> reason:<text>`
