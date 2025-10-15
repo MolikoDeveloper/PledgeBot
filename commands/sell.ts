@@ -390,12 +390,12 @@ async function handleCreateSubcommand(params: {
     let announcementMetadataError: Error | null = null;
     let announcementPatchError: Error | null = null;
 
+    const configuredForumTags =
+        tradeConfig.tradeChannelType === "forum" ? tradeConfig.sellForumTagIds : [];
+    const appliedForumTags = configuredForumTags.length > 0 ? configuredForumTags : undefined;
+
     if (!config.allowOffline) {
         try {
-            const appliedTags =
-                tradeConfig.tradeChannelType === "forum" && tradeConfig.sellForumTagId
-                    ? [tradeConfig.sellForumTagId]
-                    : undefined;
             const result = await deliverTradeAnnouncement({
                 token: config.botToken,
                 guildId,
@@ -405,7 +405,7 @@ async function handleCreateSubcommand(params: {
                 threadName,
                 embed,
                 userId: user.id,
-                appliedTags,
+                appliedTags: appliedForumTags,
             });
             announcementUrl = result.url;
 
@@ -446,9 +446,15 @@ async function handleCreateSubcommand(params: {
         }
     }
 
+    const forumTagConfirmation =
+        appliedForumTags && !announcementError && !config.allowOffline
+            ? `Applied forum ${appliedForumTags.length === 1 ? "tag" : "tags"}: ${appliedForumTags.join(", ")}`
+            : undefined;
+
     const confirmationLines = [
         `Trade #${trade.id} created successfully.`,
         announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
+        forumTagConfirmation,
         "Use the buttons below to manage this trade.",
         announcementError ? "Warning: Failed to post the trade announcement." : undefined,
         controlMetadataError ? "Warning: Failed to store trade control metadata." : undefined,

@@ -187,12 +187,12 @@ const buyCommand: CommandModule = {
         let storedChannelId = order.announcement_channel_id;
         let storedMessageId = order.announcement_message_id;
 
+        const configuredForumTags =
+            tradeConfig.tradeChannelType === "forum" ? tradeConfig.buyForumTagIds : [];
+        const appliedForumTags = configuredForumTags.length > 0 ? configuredForumTags : undefined;
+
         if (!config.allowOffline) {
             try {
-                const appliedTags =
-                    tradeConfig.tradeChannelType === "forum" && tradeConfig.buyForumTagId
-                        ? [tradeConfig.buyForumTagId]
-                        : undefined;
                 const result: AnnouncementResult = await deliverTradeAnnouncement({
                     token: config.botToken,
                     guildId,
@@ -202,7 +202,7 @@ const buyCommand: CommandModule = {
                     threadName,
                     embed,
                     userId: user.id,
-                    appliedTags,
+                    appliedTags: appliedForumTags,
                 });
                 announcementUrl = result.url;
 
@@ -237,9 +237,15 @@ const buyCommand: CommandModule = {
         });
 
         const announcementLink = announcementUrl ?? fallbackUrl;
+        const forumTagConfirmation =
+            appliedForumTags && !announcementError && !config.allowOffline
+                ? `Applied forum ${appliedForumTags.length === 1 ? "tag" : "tags"}: ${appliedForumTags.join(", ")}`
+                : undefined;
+
         const responseLines = [
             `Buy order #${order.id} created successfully.`,
             announcementLink ? `Announcement: ${announcementLink}` : undefined,
+            forumTagConfirmation,
             config.allowOffline ? "Offline mode: announcement was not sent." : undefined,
             announcementError ? "Warning: Failed to post the buy order announcement." : undefined,
             announcementMetadataError ? "Warning: Failed to store announcement metadata." : undefined,

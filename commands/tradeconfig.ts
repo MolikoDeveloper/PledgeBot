@@ -4,12 +4,14 @@ import {
 } from "discord-interactions";
 
 import {
+    addTradeForumTag,
     addTradeRole,
     getTradeConfig,
+    getTradeForumTags,
     listTradeRoles,
+    removeTradeForumTag,
     removeTradeRole,
     setTradeChannel,
-    updateTradeForumTags,
 } from "../src/database";
 import { ensureAdminAccess } from "../src/permissions";
 import {
@@ -95,27 +97,65 @@ const commandData: CommandData = {
             options: [
                 {
                     type: ApplicationCommandOptionType.SUB_COMMAND,
-                    name: "sell",
-                    description: "Set or clear the forum tag used for sell announcements.",
+                    name: "sell-add",
+                    description: "Associate a forum tag with sell announcements.",
                     options: [
                         {
                             type: ApplicationCommandOptionType.STRING,
                             name: "tag_id",
-                            description: "Forum tag snowflake to apply (omit to clear).",
+                            description: "Forum tag snowflake to add.",
+                            required: true,
                         },
                     ],
                 },
                 {
                     type: ApplicationCommandOptionType.SUB_COMMAND,
-                    name: "buy",
-                    description: "Set or clear the forum tag used for buy announcements.",
+                    name: "sell-remove",
+                    description: "Remove a forum tag from sell announcements.",
                     options: [
                         {
                             type: ApplicationCommandOptionType.STRING,
                             name: "tag_id",
-                            description: "Forum tag snowflake to apply (omit to clear).",
+                            description: "Forum tag snowflake to remove.",
+                            required: true,
                         },
                     ],
+                },
+                {
+                    type: ApplicationCommandOptionType.SUB_COMMAND,
+                    name: "sell-list",
+                    description: "List the forum tags configured for sell announcements.",
+                },
+                {
+                    type: ApplicationCommandOptionType.SUB_COMMAND,
+                    name: "buy-add",
+                    description: "Associate a forum tag with buy announcements.",
+                    options: [
+                        {
+                            type: ApplicationCommandOptionType.STRING,
+                            name: "tag_id",
+                            description: "Forum tag snowflake to add.",
+                            required: true,
+                        },
+                    ],
+                },
+                {
+                    type: ApplicationCommandOptionType.SUB_COMMAND,
+                    name: "buy-remove",
+                    description: "Remove a forum tag from buy announcements.",
+                    options: [
+                        {
+                            type: ApplicationCommandOptionType.STRING,
+                            name: "tag_id",
+                            description: "Forum tag snowflake to remove.",
+                            required: true,
+                        },
+                    ],
+                },
+                {
+                    type: ApplicationCommandOptionType.SUB_COMMAND,
+                    name: "buy-list",
+                    description: "List the forum tags configured for buy announcements.",
                 },
             ],
         },
@@ -291,45 +331,149 @@ async function handleRoles(params: {
     }
 }
 
+type ForumTagSubcommand = {
+    type: "sell" | "buy";
+    action: "add" | "remove" | "list";
+};
+
+function parseForumTagSubcommand(name: string): ForumTagSubcommand | null {
+    const [type, action] = name.split("-");
+
+    if ((type !== "sell" && type !== "buy") || !action) {
+        return null;
+    }
+
+    if (action !== "add" && action !== "remove" && action !== "list") {
+        return null;
+    }
+
+    return { type, action };
+}
+
 async function handleForumTags(params: {
     interaction: CommandExecuteContext["interaction"];
+    resolution: SubcommandResolution;
 }): Promise<CommandResponse> {
-    const { interaction } = params;
+    const { interaction, resolution } = params;
 
-    if (!interaction.guild_id) {
+    const rawGuildId = typeof interaction.guild_id === "string" ? interaction.guild_id.trim() : "";
+    if (!rawGuildId) {
         return buildReply("This command can only be used in a guild.");
     }
 
-    const resolution = extractSubcommand(interaction);
-    if (resolution.group !== "forumtags" || !resolution.subcommand) {
+    const guildId = rawGuildId;
+
+    if (!resolution.subcommand) {
         return buildReply("Unsupported subcommand.");
     }
 
-    const lookup = normalizeOptions(resolution.options);
-    const guildId = interaction.guild_id;
-    const tagIdRaw = getStringOption(lookup, "tag_id");
-    const tagId = tagIdRaw && tagIdRaw.trim().length > 0 ? tagIdRaw.trim() : null;
-
-    const tradeConfig = await getTradeConfig(guildId);
-    if (tradeConfig.tradeChannelType !== "forum" || !tradeConfig.tradeChannelId) {
-        return buildReply("Configure a forum trade channel before setting forum tags.");
+    const parsed = parseForumTagSubcommand(resolution.subcommand);
+    if (!parsed) {
+        return buildReply("Unsupported subcommand.");
     }
 
-    switch (resolution.subcommand) {
-        case "sell": {
-            await updateTradeForumTags({ guildId, sellForumTagId: tagId });
-            return tagId
-                ? buildReply(`Sell announcements will use forum tag ${tagId}.`)
-                : buildReply("Sell announcement forum tag cleared.");
+    const { type: resolvedType, action: resolvedAction } = parsed;
+
+    const lookup = normalizeOptions(resolution.options);
+    const typeLabel = resolvedType === "sell" ? "Sell" : "Buy";
+    let currentConfig;
+    try {
+        currentConfig = await getTradeConfig(guildId);
+    } catch (error) {
+        console.error("Failed to load trade configuration for guild", guildId, error);
+        return buildReply("Could not load the current trade configuration. Please try again later.");
+    }
+
+    if (currentConfig.tradeChannelType !== "forum" || !currentConfig.tradeChannelId) {
+        return buildReply("Configure a forum trade channel before managing forum tags.");
+    }
+
+    try {
+        switch (resolvedAction) {
+            case "add": {
+                const tagIdRaw = getStringOption(lookup, "tag_id");
+                const tagId = tagIdRaw?.trim();
+                if (!tagId) {
+                    return buildReply(`Provide the forum tag ID to add for ${resolvedType} announcements.`);
+                }
+
+                const existingTags =
+                    resolvedType === "sell"
+                        ? currentConfig.sellForumTagIds
+                        : currentConfig.buyForumTagIds;
+
+                if (existingTags.includes(tagId)) {
+                    return buildReply(
+                        `Forum tag ${tagId} is already configured for ${typeLabel.toLowerCase()} announcements.`,
+                    );
+                }
+
+                const result = await addTradeForumTag({ guildId, kind: resolvedType, tagId });
+                if (!result.added) {
+                    return buildReply(
+                        `Forum tag ${tagId} is already configured for ${typeLabel.toLowerCase()} announcements.`,
+                    );
+                }
+
+                return buildReply(`Added forum tag ${tagId} for ${typeLabel.toLowerCase()} announcements.`);
+            }
+            case "remove": {
+                const tagIdRaw = getStringOption(lookup, "tag_id");
+                const tagId = tagIdRaw?.trim();
+                if (!tagId) {
+                    return buildReply(`Provide the forum tag ID to remove from ${resolvedType} announcements.`);
+                }
+
+                const existingTags =
+                    resolvedType === "sell"
+                        ? currentConfig.sellForumTagIds
+                        : currentConfig.buyForumTagIds;
+
+                if (!existingTags.includes(tagId)) {
+                    return buildReply(
+                        `Forum tag ${tagId} is not configured for ${typeLabel.toLowerCase()} announcements.`,
+                    );
+                }
+
+                const result = await removeTradeForumTag({ guildId, kind: resolvedType, tagId });
+                if (!result.removed) {
+                    return buildReply(
+                        `Forum tag ${tagId} is not configured for ${typeLabel.toLowerCase()} announcements.`,
+                    );
+                }
+
+                return buildReply(`Removed forum tag ${tagId} from ${typeLabel.toLowerCase()} announcements.`);
+            }
+            case "list": {
+                const tags = await getTradeForumTags(guildId);
+                const formatTagList = (tagIds: string[]): string => {
+                    if (tagIds.length === 0) {
+                        return "• None configured";
+                    }
+
+                    return tagIds.map((value) => `• ${value}`).join("\n");
+                };
+
+                const sellList = formatTagList(tags.sell);
+                const buyList = formatTagList(tags.buy);
+
+                const message = [
+                    "Current forum tag configuration:",
+                    `Sell announcements:\n${sellList}`,
+                    `Buy announcements:\n${buyList}`,
+                ].join("\n\n");
+
+                return buildReply(message);
+            }
+            default:
+                return buildReply("Unsupported subcommand.");
         }
-        case "buy": {
-            await updateTradeForumTags({ guildId, buyForumTagId: tagId });
-            return tagId
-                ? buildReply(`Buy announcements will use forum tag ${tagId}.`)
-                : buildReply("Buy announcement forum tag cleared.");
-        }
-        default:
-            return buildReply("Unsupported subcommand.");
+    } catch (error) {
+        console.error(
+            `Failed to ${resolvedAction} forum tags for guild ${guildId} (${resolvedType})`,
+            error,
+        );
+        return buildReply("Something went wrong while updating forum tags. Please try again later.");
     }
 }
 
@@ -353,7 +497,7 @@ const tradeConfigCommand: CommandModule = {
         }
 
         if (resolution.group === "forumtags") {
-            return handleForumTags({ interaction });
+            return handleForumTags({ interaction, resolution });
         }
 
         if (resolution.subcommand === "channel") {

@@ -16,7 +16,7 @@ const helpMessage = [
     "• `/trade cancel` — Cancel a trade by ID and share the reason.",
     "• `/trade history` — Review your trade history with optional page and status filters.",
     "• `/tradeconfig channel` — Set the trade announcement channel and type (forum or text).",
-    "• `/tradeconfig forumtags` — Configure optional forum tags for buy and sell announcements.",
+    "• `/tradeconfig forumtags` — Add, remove, or list forum tags for buy and sell announcements.",
     "• `/tradeconfig roles` — Manage the roles required to run trade commands.",
     "",
 ].join("\n");

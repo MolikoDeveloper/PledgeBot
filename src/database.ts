@@ -152,6 +152,82 @@ export async function initializeDatabase(): Promise<void> {
     }
 
     db.run(`
+        CREATE TABLE IF NOT EXISTS guild_forum_tags (
+            guild_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('sell','buy')),
+            tag_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (guild_id, kind, tag_id),
+            FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE
+        )
+    `);
+
+    const migrateLegacyForumTags = db.transaction(() => {
+        const legacyRows = db
+            .prepare(
+                `SELECT id, sell_forum_tag_id, buy_forum_tag_id FROM guilds WHERE sell_forum_tag_id IS NOT NULL OR buy_forum_tag_id IS NOT NULL`,
+            )
+            .all() as { id: string; sell_forum_tag_id: string | null; buy_forum_tag_id: string | null }[];
+
+        if (legacyRows.length === 0) {
+            return;
+        }
+
+        const insertStmt = db.prepare(`
+            INSERT INTO guild_forum_tags (guild_id, kind, tag_id)
+            VALUES (:guildId, :kind, :tagId)
+            ON CONFLICT (guild_id, kind, tag_id) DO NOTHING
+        `);
+
+        const normalize = (value: string | null): string[] => {
+            if (!value) {
+                return [];
+            }
+
+            return value
+                .split(/[\s,]+/)
+                .map((part) => part.trim())
+                .filter((part) => part.length > 0);
+        };
+
+        for (const row of legacyRows) {
+            const sellTags = normalize(row.sell_forum_tag_id);
+            const buyTags = normalize(row.buy_forum_tag_id);
+
+            for (const tagId of sellTags) {
+                insertStmt.run({ guildId: row.id, kind: "sell", tagId });
+            }
+
+            for (const tagId of buyTags) {
+                insertStmt.run({ guildId: row.id, kind: "buy", tagId });
+            }
+
+            const updates: string[] = [];
+            if (row.sell_forum_tag_id !== null) {
+                updates.push("sell_forum_tag_id = NULL");
+            }
+            if (row.buy_forum_tag_id !== null) {
+                updates.push("buy_forum_tag_id = NULL");
+            }
+
+            if (updates.length > 0) {
+                db.run(
+                    `
+                    UPDATE guilds
+                    SET ${updates.join(",\n                        ")},
+                        updated_at = datetime('now')
+                    WHERE id = :guildId
+                    `,
+                    { guildId: row.id },
+                );
+            }
+        }
+    });
+
+    migrateLegacyForumTags();
+
+    db.run(`
         CREATE TABLE IF NOT EXISTS guild_roles (
             guild_id TEXT NOT NULL,
             role_id TEXT NOT NULL,
@@ -249,8 +325,8 @@ export async function initializeDatabase(): Promise<void> {
         const selectDoneOne = tradeColumnNames.has("done_one_button_custom_id")
             ? "done_one_button_custom_id"
             : tradeColumnNames.has("close_button_custom_id")
-              ? "close_button_custom_id"
-              : "NULL";
+                ? "close_button_custom_id"
+                : "NULL";
         const selectDoneAll = tradeColumnNames.has("done_all_button_custom_id")
             ? "done_all_button_custom_id"
             : "NULL";
@@ -380,7 +456,7 @@ export async function initializeDatabase(): Promise<void> {
 
 export async function recordGuild(guildId: string, name: string | null | undefined, adminRoleId?: string | null): Promise<void> {
     const resolvedName = typeof name === "string" && name.trim().length > 0 ? name : guildId;
-    
+
     run(
         `
         INSERT INTO guilds (id, name, admin_role_id)
@@ -448,8 +524,6 @@ export async function setTradeChannel(params: {
     guildName?: string;
     channelId: string;
     channelType: 'forum' | 'text';
-    sellForumTagId?: string | null;
-    buyForumTagId?: string | null;
 }): Promise<void> {
     let guildName = params.guildName;
     if (!guildName) {
@@ -469,16 +543,6 @@ export async function setTradeChannel(params: {
         channelType: params.channelType,
     };
 
-    if (params.sellForumTagId !== undefined) {
-        updates.push("sell_forum_tag_id = :sellForumTagId");
-        queryParams.sellForumTagId = params.sellForumTagId ?? null;
-    }
-
-    if (params.buyForumTagId !== undefined) {
-        updates.push("buy_forum_tag_id = :buyForumTagId");
-        queryParams.buyForumTagId = params.buyForumTagId ?? null;
-    }
-
     updates.push("updated_at = datetime('now')");
 
     run(
@@ -496,17 +560,13 @@ export async function setTradeChannel(params: {
             id,
             name,
             trade_channel_id,
-            trade_channel_type,
-            sell_forum_tag_id,
-            buy_forum_tag_id
+            trade_channel_type
         )
         SELECT
             :guildId,
             :guildName,
             :channelId,
-            :channelType,
-            :sellForumTagId,
-            :buyForumTagId
+            :channelType
         WHERE NOT EXISTS (SELECT 1 FROM guilds WHERE id = :guildId)
         `,
         {
@@ -514,68 +574,124 @@ export async function setTradeChannel(params: {
             guildName,
             channelId: params.channelId,
             channelType: params.channelType,
-            sellForumTagId: params.sellForumTagId ?? null,
-            buyForumTagId: params.buyForumTagId ?? null,
         },
     );
 }
 
-export async function updateTradeForumTags(params: {
+type TradeForumTagKind = "sell" | "buy";
+
+export async function addTradeForumTag(params: {
     guildId: string;
-    guildName?: string;
-    sellForumTagId?: string | null;
-    buyForumTagId?: string | null;
-}): Promise<void> {
-    const updates: string[] = [];
-    const queryParams: QueryParams = { guildId: params.guildId };
-
-    if (params.sellForumTagId !== undefined) {
-        updates.push("sell_forum_tag_id = :sellForumTagId");
-        queryParams.sellForumTagId = params.sellForumTagId ?? null;
+    kind: TradeForumTagKind;
+    tagId: string;
+}): Promise<{ added: boolean }> {
+    const guildId = (params.guildId ?? "").trim();
+    if (!guildId) {
+        throw new Error("Cannot add forum tag without a guild ID.");
     }
 
-    if (params.buyForumTagId !== undefined) {
-        updates.push("buy_forum_tag_id = :buyForumTagId");
-        queryParams.buyForumTagId = params.buyForumTagId ?? null;
-    }
+    await ensureGuildRecord(guildId);
 
-    if (updates.length === 0) {
-        return;
-    }
-
-    updates.push("updated_at = datetime('now')");
-
-    run(
-        `
-        INSERT INTO guilds (
-            id,
-            name,
-            sell_forum_tag_id,
-            buy_forum_tag_id
+    try {
+        const result = run(`
+                INSERT INTO guild_forum_tags (guild_id, kind, tag_id)
+                VALUES (:guildId, :kind, :tagId)
+                ON CONFLICT (guild_id, kind, tag_id) DO NOTHING
+            `, {
+            guildId,
+            kind: params.kind,
+            tagId: params.tagId,
+        }
         )
-        SELECT
-            :guildId,
-            :guildName,
-            :sellForumTagId,
-            :buyForumTagId
-        WHERE NOT EXISTS (SELECT 1 FROM guilds WHERE id = :guildId)
+        return { added: true };
+    }
+    catch (err) {
+        console.error(err);
+        return { added: false };
+    }
+}
+
+export async function removeTradeForumTag(params: {
+    guildId: string;
+    kind: TradeForumTagKind;
+    tagId: string;
+}): Promise<{ removed: boolean }> {
+    const guildId = (params.guildId ?? "").trim();
+    if (!guildId) {
+        throw new Error("Cannot remove forum tag without a guild ID.");
+    }
+
+    try {
+        const result = run(`
+            DELETE FROM guild_forum_tags
+            WHERE guild_id = :guildId AND kind = :kind AND tag_id = :tagId
+            `, {
+            guildId,
+            kind: params.kind,
+            tagId: params.tagId,
+        }
+        )
+        return { removed: true };
+    }
+    catch (err) {
+        console.error(err);
+        return { removed: false };
+    }
+}
+
+export async function listTradeForumTags(
+    guildId: string,
+    kind: TradeForumTagKind,
+): Promise<string[]> {
+    const normalizedGuildId = (guildId ?? "").trim();
+    if (!normalizedGuildId) {
+        throw new Error("Cannot list forum tags without a guild ID.");
+    }
+
+    const rows = all<{ tag_id: string }>(
+        `
+        SELECT tag_id
+        FROM guild_forum_tags
+        WHERE guild_id = :guildId AND kind = :kind
+        ORDER BY created_at, tag_id
         `,
-        {
-            guildId: params.guildId,
-            guildName: params.guildName ?? params.guildId,
-            sellForumTagId: params.sellForumTagId ?? null,
-            buyForumTagId: params.buyForumTagId ?? null,
-        },
+        { guildId: normalizedGuildId, kind },
     );
 
-    run(
+    return rows.map((row) => row.tag_id);
+}
+
+export async function getTradeForumTags(guildId: string): Promise<{
+    sell: string[];
+    buy: string[];
+}> {
+    const normalizedGuildId = (guildId ?? "").trim();
+    if (!normalizedGuildId) {
+        throw new Error("Cannot fetch forum tags without a guild ID.");
+    }
+
+    const rows = all<{ kind: TradeForumTagKind; tag_id: string }>(
         `
-        UPDATE guilds
-        SET ${updates.join(',\n            ')}
-        WHERE id = :guildId
+        SELECT kind, tag_id
+        FROM guild_forum_tags
+        WHERE guild_id = :guildId
+        ORDER BY kind, created_at, tag_id
         `,
-        queryParams,
+        { guildId: normalizedGuildId },
     );
+
+    const sell: string[] = [];
+    const buy: string[] = [];
+
+    for (const row of rows) {
+        if (row.kind === "sell") {
+            sell.push(row.tag_id);
+        } else if (row.kind === "buy") {
+            buy.push(row.tag_id);
+        }
+    }
+
+    return { sell, buy };
 }
 
 export async function updateAdminRole(guildId: string, roleId: string | null, guildName?: string): Promise<void> {
@@ -648,37 +764,40 @@ export async function getTradeConfig(guildId: string): Promise<{
     tradeChannelId: string | null;
     tradeChannelType: 'forum' | 'text' | null;
     adminRoleId: string | null;
-    sellForumTagId: string | null;
-    buyForumTagId: string | null;
+    sellForumTagIds: string[];
+    buyForumTagIds: string[];
 }> {
+    const normalizedGuildId = (guildId ?? "").trim();
+    if (!normalizedGuildId) {
+        throw new Error("Cannot load trade configuration without a guild ID.");
+    }
+
     const row = get<{
         trade_channel_id: string | null;
         trade_channel_type: 'forum' | 'text' | null;
         admin_role_id: string | null;
-        sell_forum_tag_id: string | null;
-        buy_forum_tag_id: string | null;
     }>(
         `
         SELECT
             trade_channel_id,
             trade_channel_type,
-            admin_role_id,
-            sell_forum_tag_id,
-            buy_forum_tag_id
+            admin_role_id
         FROM guilds
         WHERE id = :guildId
         LIMIT 1
         `,
-        { guildId },
+        { guildId: normalizedGuildId },
     );
+
+    const tags = await getTradeForumTags(normalizedGuildId);
 
     if (!row) {
         return {
             tradeChannelId: null,
             tradeChannelType: null,
             adminRoleId: null,
-            sellForumTagId: null,
-            buyForumTagId: null,
+            sellForumTagIds: tags.sell,
+            buyForumTagIds: tags.buy,
         };
     }
 
@@ -686,8 +805,8 @@ export async function getTradeConfig(guildId: string): Promise<{
         tradeChannelId: row.trade_channel_id,
         tradeChannelType: row.trade_channel_type,
         adminRoleId: row.admin_role_id,
-        sellForumTagId: row.sell_forum_tag_id,
-        buyForumTagId: row.buy_forum_tag_id,
+        sellForumTagIds: tags.sell,
+        buyForumTagIds: tags.buy,
     };
 }
 
