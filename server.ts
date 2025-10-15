@@ -6,7 +6,13 @@ import {
 } from "discord-interactions";
 
 import commands, { commandMap } from "./commands";
-import { ApplicationCommandType, type ChatInputCommandInteraction, type CommandResponse } from "./commands/types";
+import { handleTradeComponent } from "./commands/trade-component";
+import {
+    ApplicationCommandType,
+    type ChatInputCommandInteraction,
+    type CommandResponse,
+    type MessageComponentInteraction,
+} from "./commands/types";
 import { config } from "./src/config";
 import { initializeDatabase } from "./src/database";
 
@@ -126,6 +132,24 @@ async function handleInteraction(request: Request): Promise<Response> {
 
     if (base?.type === InteractionType.PING) {
         return jsonResponse({ type: InteractionResponseType.PONG });
+    }
+
+    if (base?.type === InteractionType.MESSAGE_COMPONENT) {
+        const interaction = payload as MessageComponentInteraction;
+
+        try {
+            const response = await handleTradeComponent({ interaction, config });
+            return jsonResponse(response);
+        } catch (error) {
+            console.error("Component interaction handler failed", error);
+            return jsonResponse({
+                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                data: {
+                    content: "An unexpected error occurred while processing the component interaction.",
+                    flags: InteractionResponseFlags.EPHEMERAL,
+                },
+            });
+        }
     }
 
     if (base?.type !== InteractionType.APPLICATION_COMMAND) {

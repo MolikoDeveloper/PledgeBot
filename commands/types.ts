@@ -180,6 +180,28 @@ export interface ChatInputCommandInteraction {
     token: string;
 }
 
+export interface MessageComponentData {
+    component_type: ComponentType;
+    custom_id: string;
+    values?: string[];
+}
+
+export interface MessageComponentInteraction {
+    id: string;
+    application_id: string;
+    type: InteractionType;
+    data: MessageComponentData;
+    guild_id?: string;
+    channel_id?: string;
+    member?: InteractionMember;
+    user?: InteractionUser;
+    token: string;
+    message?: {
+        id: string;
+        channel_id?: string;
+    };
+}
+
 export interface InteractionMessageResponseData {
     content?: string;
     flags?: number;
