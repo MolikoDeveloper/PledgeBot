@@ -188,6 +188,10 @@ const buyCommand: CommandModule = {
 
         if (!config.allowOffline) {
             try {
+                const appliedTags =
+                    tradeConfig.tradeChannelType === "forum" && tradeConfig.buyForumTagId
+                        ? [tradeConfig.buyForumTagId]
+                        : undefined;
                 const result: AnnouncementResult = await deliverTradeAnnouncement({
                     token: config.botToken,
                     guildId,
@@ -197,6 +201,7 @@ const buyCommand: CommandModule = {
                     threadName,
                     embed,
                     userId: user.id,
+                    appliedTags,
                 });
                 announcementUrl = result.url;
 

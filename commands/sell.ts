@@ -347,6 +347,10 @@ async function handleCreateSubcommand(params: {
 
     if (!config.allowOffline) {
         try {
+            const appliedTags =
+                tradeConfig.tradeChannelType === "forum" && tradeConfig.sellForumTagId
+                    ? [tradeConfig.sellForumTagId]
+                    : undefined;
             const result = await deliverTradeAnnouncement({
                 token: config.botToken,
                 guildId,
@@ -356,6 +360,7 @@ async function handleCreateSubcommand(params: {
                 threadName,
                 embed,
                 userId: user.id,
+                appliedTags,
             });
             announcementUrl = result.url;
 

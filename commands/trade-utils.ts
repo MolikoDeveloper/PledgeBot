@@ -222,6 +222,7 @@ export async function deliverTradeAnnouncement(params: {
     threadName: string;
     embed: Record<string, unknown>;
     userId: string;
+    appliedTags?: string[];
 }): Promise<AnnouncementResult> {
     const baseHeaders = {
         Authorization: `Bot ${params.token}`,
@@ -258,17 +259,23 @@ export async function deliverTradeAnnouncement(params: {
         };
     }
 
+    const threadPayload: Record<string, unknown> = {
+        name: params.threadName,
+        message: {
+            content: params.content,
+            embeds: [params.embed],
+            allowed_mentions: allowedMentions,
+        },
+    };
+
+    if (params.appliedTags && params.appliedTags.length > 0) {
+        threadPayload.applied_tags = params.appliedTags;
+    }
+
     const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/threads`, {
         method: "POST",
         headers: baseHeaders,
-        body: JSON.stringify({
-            name: params.threadName,
-            message: {
-                content: params.content,
-                embeds: [params.embed],
-                allowed_mentions: allowedMentions,
-            },
-        }),
+        body: JSON.stringify(threadPayload),
     });
 
     if (!response.ok) {
