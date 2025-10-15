@@ -3,8 +3,10 @@ import { InteractionResponseFlags, InteractionResponseType } from "discord-inter
 import {
     getTradeById,
     getUserById,
+    reduceTradeStock,
     updateTradeAnnouncementMetadata,
     updateTradeStatus,
+    type TradeRecord,
 } from "../src/database";
 import type { AppConfig } from "../src/config";
 import {
@@ -14,7 +16,8 @@ import {
     resolveStatusLabel,
     resolveUserTag,
 } from "./trade-utils";
-import type { CommandResponse, MessageComponentInteraction } from "./types";
+import type { CommandResponse, MessageComponent, MessageComponentInteraction } from "./types";
+import { ButtonStyle, ComponentType } from "./types";
 
 function buildEphemeralResponse(content: string): CommandResponse {
     return {
@@ -30,11 +33,12 @@ function extractUserId(interaction: MessageComponentInteraction): string | null 
     return interaction.member?.user?.id ?? interaction.user?.id ?? null;
 }
 
-async function updateAnnouncementControls(tradeId: number): Promise<Error | null> {
+async function clearTradeControls(tradeId: number): Promise<Error | null> {
     try {
         await updateTradeAnnouncementMetadata({
             tradeId,
-            closeButtonId: null,
+            doneOneButtonId: null,
+            doneAllButtonId: null,
             cancelButtonId: null,
         });
         return null;
@@ -45,20 +49,72 @@ async function updateAnnouncementControls(tradeId: number): Promise<Error | null
     }
 }
 
-async function handleCloseAction(params: {
+function buildActiveComponents(trade: TradeRecord): MessageComponent[] {
+    if (trade.status !== "open" || trade.stock <= 0) {
+        return [];
+    }
+
+    if (!trade.done_one_button_custom_id || !trade.cancel_button_custom_id) {
+        return [];
+    }
+
+    const buttons: MessageComponent["components"] = [
+        {
+            type: ComponentType.BUTTON,
+            style: ButtonStyle.SUCCESS,
+            label: "Done 1 item",
+            custom_id: trade.done_one_button_custom_id,
+        },
+    ];
+
+    if (trade.stock > 1 && trade.done_all_button_custom_id) {
+        buttons.push({
+            type: ComponentType.BUTTON,
+            style: ButtonStyle.PRIMARY,
+            label: "Done all",
+            custom_id: trade.done_all_button_custom_id,
+        });
+    }
+
+    buttons.push({
+        type: ComponentType.BUTTON,
+        style: ButtonStyle.DANGER,
+        label: "Cancel",
+        custom_id: trade.cancel_button_custom_id,
+    });
+
+    return [
+        {
+            type: ComponentType.ACTION_ROW,
+            components: buttons,
+        },
+    ];
+}
+
+async function handleDoneAction(params: {
     interaction: MessageComponentInteraction;
     config: AppConfig;
     trade: Awaited<ReturnType<typeof getTradeById>>;
     customId: string;
     userId: string;
+    mode: "one" | "all";
 }): Promise<CommandResponse> {
-    const { interaction, config, trade, customId, userId } = params;
+    const { interaction, config, trade, customId, userId, mode } = params;
 
     if (!trade) {
         return buildEphemeralResponse("Trade not found.");
     }
 
-    if (trade.close_button_custom_id && trade.close_button_custom_id !== customId) {
+    if (mode === "all" && !trade.done_all_button_custom_id) {
+        return buildEphemeralResponse("This trade action is no longer valid.");
+    }
+
+    if (mode === "one" && !trade.done_one_button_custom_id) {
+        return buildEphemeralResponse("This trade action is no longer valid.");
+    }
+
+    const expectedCustomId = mode === "all" ? trade.done_all_button_custom_id : trade.done_one_button_custom_id;
+    if (expectedCustomId && expectedCustomId !== customId) {
         return buildEphemeralResponse("This trade action is no longer valid.");
     }
 
@@ -67,12 +123,19 @@ async function handleCloseAction(params: {
         return buildEphemeralResponse(`Trade #${trade.id} is already ${statusLabel}.`);
     }
 
-    const updated = await updateTradeStatus({ tradeId: trade.id, status: "complete" });
-    if (!updated) {
-        return buildEphemeralResponse("Failed to update the trade status. Try again in a moment.");
+    if (trade.stock <= 0) {
+        return buildEphemeralResponse(`Trade #${trade.id} has no remaining stock.`);
     }
 
-    const metadataError = await updateAnnouncementControls(trade.id);
+    const amount = mode === "all" ? trade.stock : 1;
+    const updated = await reduceTradeStock({ tradeId: trade.id, amount });
+    if (!updated) {
+        return buildEphemeralResponse(
+            `Unable to mark ${amount === 1 ? "1 item" : `${amount} items`} as done. Check the available stock and try again.`,
+        );
+    }
+
+    const metadataError = updated.status !== "open" ? await clearTradeControls(trade.id) : null;
 
     const storedUser = await getUserById(userId);
     const userTag = resolveUserTag({
@@ -93,18 +156,15 @@ async function handleCloseAction(params: {
     if (!config.allowOffline) {
         if (updated.announcement_channel_id && updated.announcement_message_id) {
             try {
-                const embed = buildTradeEmbed({
-                    trade: updated,
-                    userTag,
-                    statusLabel: "Closed",
-                });
+                const embed = buildTradeEmbed({ trade: updated, userTag });
+                const components = updated.status === "open" ? buildActiveComponents(updated) : [];
 
                 await patchTradeAnnouncement({
                     token: config.botToken,
                     channelId: updated.announcement_channel_id,
                     messageId: updated.announcement_message_id,
                     embed,
-                    components: [],
+                    components,
                 });
             } catch (error) {
                 announcementPatchError =
@@ -116,8 +176,10 @@ async function handleCloseAction(params: {
         }
     }
 
+    const amountText = amount === 1 ? "1 item" : `${amount} items`;
     const responseLines = [
-        `Trade #${updated.id} marked as closed.`,
+        `Marked ${amountText} as done for trade #${updated.id}.`,
+        updated.status === "open" ? `Remaining stock: ${updated.stock}.` : "Trade is now marked as sold out.",
         announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
         config.allowOffline ? "Offline mode: announcement was not updated." : undefined,
         missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
@@ -159,7 +221,7 @@ async function handleCancelAction(params: {
         return buildEphemeralResponse("Failed to update the trade status. Try again in a moment.");
     }
 
-    const metadataError = await updateAnnouncementControls(trade.id);
+    const metadataError = await clearTradeControls(trade.id);
 
     const storedUser = await getUserById(userId);
     const userTag = resolveUserTag({
@@ -234,13 +296,14 @@ export async function handleTradeComponent(params: {
         return buildEphemeralResponse("Unable to determine the user for this interaction.");
     }
 
-    const match = /^trade:(\d+):([a-zA-Z]+)$/.exec(interaction.data.custom_id);
-    if (!match) {
+    const parts = interaction.data.custom_id.split(":");
+    if (parts.length < 3 || parts[0] !== "trade") {
         return buildEphemeralResponse("Unsupported trade component.");
     }
 
-    const tradeId = Number.parseInt(match[1], 10);
-    const action = match[2].toLowerCase();
+    const tradeId = Number.parseInt(parts[1] ?? "", 10);
+    const action = (parts[2] ?? "").toLowerCase();
+    const scope = (parts[3] ?? "").toLowerCase();
 
     if (!Number.isInteger(tradeId) || tradeId <= 0) {
         return buildEphemeralResponse("Invalid trade identifier.");
@@ -255,8 +318,16 @@ export async function handleTradeComponent(params: {
         return buildEphemeralResponse("Only the seller can manage this trade.");
     }
 
-    if (action === "close") {
-        return handleCloseAction({ interaction, config, trade, customId: interaction.data.custom_id, userId });
+    if (action === "done") {
+        const mode: "one" | "all" = scope === "all" ? "all" : "one";
+        return handleDoneAction({
+            interaction,
+            config,
+            trade,
+            customId: interaction.data.custom_id,
+            userId,
+            mode,
+        });
     }
 
     if (action === "cancel") {

@@ -9,6 +9,8 @@ export function resolveStatusLabel(status: TradeStatus): string {
             return "Open";
         case "complete":
             return "Closed";
+        case "selled":
+            return "Sold";
         case "cancelled":
             return "Cancelled";
         case "matched":
