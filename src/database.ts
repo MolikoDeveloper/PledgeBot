@@ -786,8 +786,6 @@ export async function listTrades(params: {
         throw new Error(`Invalid trade status: ${params.status}`);
     }
 
-    console.log(params)
-
     if (params.status) {
         return all<TradeRecord>(
             `
