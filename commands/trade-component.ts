@@ -11,6 +11,7 @@ import {
 import type { AppConfig } from "../src/config";
 import {
     buildAnnouncementUrl,
+    buildTradeAnnouncementContent,
     buildTradeEmbed,
     patchTradeAnnouncement,
     resolveStatusLabel,
@@ -158,12 +159,17 @@ async function handleDoneAction(params: {
             try {
                 const embed = buildTradeEmbed({ trade: updated, userTag });
                 const components = updated.status === "open" ? buildActiveComponents(updated) : [];
+                const announcementContent = buildTradeAnnouncementContent({
+                    trade: updated,
+                    userId: updated.user_id,
+                });
 
                 await patchTradeAnnouncement({
                     token: config.botToken,
                     channelId: updated.announcement_channel_id,
                     messageId: updated.announcement_message_id,
                     embed,
+                    content: announcementContent,
                     components,
                 });
             } catch (error) {
@@ -247,12 +253,17 @@ async function handleCancelAction(params: {
                     userTag,
                     statusLabel: "Cancelled",
                 });
+                const announcementContent = buildTradeAnnouncementContent({
+                    trade: updated,
+                    userId: updated.user_id,
+                });
 
                 await patchTradeAnnouncement({
                     token: config.botToken,
                     channelId: updated.announcement_channel_id,
                     messageId: updated.announcement_message_id,
                     embed,
+                    content: announcementContent,
                     components: [],
                 });
             } catch (error) {

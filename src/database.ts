@@ -84,6 +84,8 @@ export type TradeRecord = {
     user_id: string;
     title: string;
     auec: number;
+    discount_percent: number | null;
+    discounted_auec: number | null;
     stock: number;
     image_url: string | null;
     announcement_channel_id: string | null;
@@ -150,6 +152,8 @@ export async function initializeDatabase(): Promise<void> {
             user_id TEXT NOT NULL,
             title TEXT NOT NULL,
             auec INTEGER NOT NULL,
+            discount_percent INTEGER CHECK (discount_percent BETWEEN 0 AND 95),
+            discounted_auec INTEGER,
             stock INTEGER NOT NULL DEFAULT 1,
             image_url TEXT,
             announcement_channel_id TEXT,
@@ -193,6 +197,10 @@ export async function initializeDatabase(): Promise<void> {
         const selectAnnouncementMessage = tradeColumnNames.has("announcement_message_id")
             ? "announcement_message_id"
             : "NULL";
+        const selectDiscountPercent = tradeColumnNames.has("discount_percent")
+            ? "discount_percent"
+            : "NULL";
+        const selectDiscountedAuec = tradeColumnNames.has("discounted_auec") ? "discounted_auec" : "NULL";
         const selectDoneOne = tradeColumnNames.has("done_one_button_custom_id")
             ? "done_one_button_custom_id"
             : tradeColumnNames.has("close_button_custom_id")
@@ -222,6 +230,8 @@ export async function initializeDatabase(): Promise<void> {
                     user_id TEXT NOT NULL,
                     title TEXT NOT NULL,
                     auec INTEGER NOT NULL,
+                    discount_percent INTEGER CHECK (discount_percent BETWEEN 0 AND 95),
+                    discounted_auec INTEGER,
                     stock INTEGER NOT NULL DEFAULT 1,
                     image_url TEXT,
                     announcement_channel_id TEXT,
@@ -246,6 +256,8 @@ export async function initializeDatabase(): Promise<void> {
                     user_id,
                     title,
                     auec,
+                    ${selectDiscountPercent} AS discount_percent,
+                    ${selectDiscountedAuec} AS discounted_auec,
                     stock,
                     image_url,
                     announcement_channel_id,
@@ -310,6 +322,14 @@ export async function initializeDatabase(): Promise<void> {
 
     if (!tradeColumnNames.has("cancel_button_custom_id")) {
         db.run(`ALTER TABLE trades ADD COLUMN cancel_button_custom_id TEXT`);
+    }
+
+    if (!tradeColumnNames.has("discount_percent")) {
+        db.run(`ALTER TABLE trades ADD COLUMN discount_percent INTEGER CHECK (discount_percent BETWEEN 0 AND 95)`);
+    }
+
+    if (!tradeColumnNames.has("discounted_auec")) {
+        db.run(`ALTER TABLE trades ADD COLUMN discounted_auec INTEGER`);
     }
 }
 
@@ -712,6 +732,42 @@ export async function reduceTradeStock(params: {
         {
             tradeId: params.tradeId,
             amount: params.amount,
+        },
+    );
+}
+
+export async function updateTradeDiscount(params: {
+    tradeId: number;
+    percent: number | null;
+}): Promise<TradeRecord | null> {
+    const { tradeId } = params;
+    const percent = params.percent;
+
+    if (percent !== null) {
+        if (!Number.isInteger(percent)) {
+            throw new Error("Discount percent must be an integer value");
+        }
+
+        if (percent < 0 || percent > 95) {
+            throw new Error("Discount percent must be between 0 and 95");
+        }
+    }
+
+    return get<TradeRecord>(
+        `
+        UPDATE trades
+        SET discount_percent = :percent,
+            discounted_auec = CASE
+                WHEN :percent IS NULL THEN NULL
+                ELSE CAST(ROUND(auec * (100 - :percent) / 100.0) AS INTEGER)
+            END,
+            updated_at = datetime('now')
+        WHERE id = :tradeId
+        RETURNING *
+        `,
+        {
+            tradeId,
+            percent: percent ?? null,
         },
     );
 }

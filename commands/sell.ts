@@ -13,6 +13,7 @@ import {
     recordGuild,
     recordUser,
     updateTradeAnnouncementMetadata,
+    updateTradeDiscount,
     type TradeRecord,
 } from "../src/database";
 import {
@@ -30,6 +31,7 @@ import {
 } from "./types";
 import {
     buildAnnouncementUrl,
+    buildTradeAnnouncementContent,
     buildTradeEmbed,
     patchTradeAnnouncement,
     resolveStatusLabel,
@@ -91,8 +93,32 @@ const commandData: CommandData = {
                 },
             ],
         },
+        {
+            type: ApplicationCommandOptionType.SUB_COMMAND,
+            name: "discount",
+            description: "Adjust the discount applied to a trade.",
+            options: [
+                {
+                    type: ApplicationCommandOptionType.INTEGER,
+                    name: "id",
+                    description: "Trade ID to update.",
+                    required: true,
+                    min_value: 1,
+                },
+                {
+                    type: ApplicationCommandOptionType.INTEGER,
+                    name: "percent",
+                    description: "Discount percentage (0 removes the discount).",
+                    required: true,
+                    min_value: 0,
+                    max_value: 95,
+                },
+            ],
+        },
     ],
 };
+
+const numberFormatter = new Intl.NumberFormat("en-US");
 
 type OptionLookup = Record<string, InteractionDataOption | undefined>;
 
@@ -102,7 +128,7 @@ type AnnouncementResult = {
     messageChannelId: string | null;
 };
 
-type SubcommandName = "create" | "done";
+type SubcommandName = "create" | "done" | "discount";
 
 type ExtractedSubcommand = {
     name: SubcommandName | null;
@@ -392,7 +418,7 @@ async function handleCreateSubcommand(params: {
         statusLabel: "Open",
     });
 
-    const content = `New trade from <@${user.id}>`;
+    const content = buildTradeAnnouncementContent({ trade, userId: user.id });
     const threadName = `${trade.title} (#${trade.id})`;
 
     let announcementUrl: string | null = null;
@@ -434,6 +460,7 @@ async function handleCreateSubcommand(params: {
                         channelId: result.messageChannelId,
                         messageId: result.messageId,
                         embed,
+                        content,
                     });
                 } catch (error) {
                     announcementPatchError = error instanceof Error
@@ -531,6 +558,10 @@ async function handleDoneSubcommand(params: {
     });
 
     const embed = buildTradeEmbed({ trade: updated, userTag });
+    const announcementContent = buildTradeAnnouncementContent({
+        trade: updated,
+        userId: updated.user_id,
+    });
     const announcementUrl = buildAnnouncementUrl({
         guildId: interaction.guild_id!,
         channelId: updated.announcement_channel_id,
@@ -566,6 +597,7 @@ async function handleDoneSubcommand(params: {
                     channelId: updated.announcement_channel_id,
                     messageId: updated.announcement_message_id,
                     embed,
+                    content: announcementContent,
                     components: updated.status === "open" ? replyComponents : [],
                 });
             } catch (error) {
@@ -590,6 +622,114 @@ async function handleDoneSubcommand(params: {
     ].filter(Boolean);
 
     return buildReply(responseLines.join("\n"), replyComponents.length > 0 ? replyComponents : undefined);
+}
+
+async function handleDiscountSubcommand(params: {
+    interaction: CommandExecuteContext["interaction"];
+    config: CommandExecuteContext["config"];
+    options: InteractionDataOption[];
+    user: InteractionUser;
+}): Promise<CommandResponse> {
+    const { interaction, config, options, user } = params;
+    const lookup = normalizeOptions(options);
+
+    const tradeId = getIntegerOption(lookup, "id");
+    const percentOption = getIntegerOption(lookup, "percent");
+
+    if (!tradeId || tradeId <= 0) {
+        return buildReply("Provide a valid trade ID to update the discount.");
+    }
+
+    if (percentOption === null || percentOption < 0 || percentOption > 95) {
+        return buildReply("Provide a discount percentage between 0 and 95.");
+    }
+
+    const trade = await getTradeById(tradeId);
+    if (!trade || trade.guild_id !== interaction.guild_id) {
+        return buildReply(`Trade #${tradeId} does not exist for this guild.`);
+    }
+
+    if (trade.user_id !== user.id) {
+        return buildReply("You can only manage your own trades.");
+    }
+
+    if (trade.status !== "open") {
+        const statusLabel = resolveStatusLabel(trade.status);
+        return buildReply(`Trade #${trade.id} is already ${statusLabel}.`);
+    }
+
+    const normalizedPercent = percentOption === 0 ? null : percentOption;
+
+    const updated = await updateTradeDiscount({
+        tradeId: trade.id,
+        percent: normalizedPercent,
+    });
+
+    if (!updated) {
+        return buildReply(`Unable to update the discount for trade #${trade.id}.`);
+    }
+
+    const storedUser = await getUserById(updated.user_id);
+    const userTag = resolveUserTag({
+        userRecord: storedUser,
+        interactionUser: user,
+        fallbackId: updated.user_id,
+    });
+
+    const embed = buildTradeEmbed({ trade: updated, userTag });
+    const announcementContent = buildTradeAnnouncementContent({
+        trade: updated,
+        userId: updated.user_id,
+    });
+
+    const announcementUrl = buildAnnouncementUrl({
+        guildId: interaction.guild_id!,
+        channelId: updated.announcement_channel_id,
+        messageId: updated.announcement_message_id,
+    });
+
+    let missingAnnouncementMetadata = false;
+    let announcementPatchError: Error | null = null;
+
+    if (!config.allowOffline) {
+        if (updated.announcement_channel_id && updated.announcement_message_id) {
+            try {
+                await patchTradeAnnouncement({
+                    token: config.botToken,
+                    channelId: updated.announcement_channel_id,
+                    messageId: updated.announcement_message_id,
+                    embed,
+                    content: announcementContent,
+                });
+            } catch (error) {
+                announcementPatchError =
+                    error instanceof Error ? error : new Error("Unknown announcement update failure.");
+                console.error(`Failed to patch trade announcement for trade #${trade.id}`, error);
+            }
+        } else {
+            missingAnnouncementMetadata = true;
+        }
+    }
+
+    const originalPrice = numberFormatter.format(updated.auec);
+    const discountedPrice =
+        updated.discounted_auec !== null ? numberFormatter.format(updated.discounted_auec) : null;
+
+    const discountLine = normalizedPercent === null
+        ? `Removed the discount for trade #${updated.id}.`
+        : `Trade #${updated.id} discounted ${updated.discount_percent}%: ${originalPrice} aUEC → ${
+              discountedPrice ?? originalPrice
+          } aUEC.`;
+
+    const lines = [
+        discountLine,
+        announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
+        config.allowOffline ? "Offline mode: announcement was not updated." : undefined,
+        missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
+        announcementPatchError ? "Warning: Failed to update the trade announcement." : undefined,
+    ].filter(Boolean);
+
+    return buildReply(lines.join("\n"));
 }
 
 async function handleDoneAllSubcommand(params: {
@@ -675,12 +815,17 @@ async function handleDoneAllSubcommand(params: {
         try {
             const embed = buildTradeEmbed({ trade: updated, userTag });
             const components = updated.status === "open" ? resolveTradeComponents(updated) : [];
+            const announcementContent = buildTradeAnnouncementContent({
+                trade: updated,
+                userId: updated.user_id,
+            });
 
             await patchTradeAnnouncement({
                 token: config.botToken,
                 channelId: updated.announcement_channel_id,
                 messageId: updated.announcement_message_id,
                 embed,
+                content: announcementContent,
                 components,
             });
         } catch (error) {
@@ -751,6 +896,15 @@ const sellCommand: CommandModule = {
 
         if (subcommandName === "done") {
             return handleDoneSubcommand({
+                interaction,
+                config,
+                options,
+                user,
+            });
+        }
+
+        if (subcommandName === "discount") {
+            return handleDiscountSubcommand({
                 interaction,
                 config,
                 options,

@@ -71,11 +71,19 @@ export function buildTradeEmbed(params: {
     const { trade, userTag } = params;
     const statusLabel = params.statusLabel ?? resolveStatusLabel(trade.status);
 
-    const fields: Array<{ name: string; value: string; inline?: boolean }> = [
-        { name: "Price", value: `${numberFormatter.format(trade.auec)} aUEC`, inline: true },
-        { name: "Stock", value: `${trade.stock}`, inline: true },
-        { name: "Trade ID", value: `#${trade.id}`, inline: true },
-    ];
+    const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+
+    if (trade.discount_percent !== null && trade.discounted_auec !== null) {
+        const discountedPrice = numberFormatter.format(trade.discounted_auec);
+        fields.push({ name: "Original Price", value: `${numberFormatter.format(trade.auec)} aUEC`, inline: true });
+        fields.push({ name: "Discount", value: `${trade.discount_percent}%`, inline: true });
+        fields.push({ name: "Final Price", value: `${discountedPrice} aUEC`, inline: true });
+    } else {
+        fields.push({ name: "Price", value: `${numberFormatter.format(trade.auec)} aUEC`, inline: true });
+    }
+
+    fields.push({ name: "Stock", value: `${trade.stock}`, inline: true });
+    fields.push({ name: "Trade ID", value: `#${trade.id}`, inline: true });
 
     if (statusLabel) {
         fields.push({ name: "Status", value: statusLabel, inline: true });
@@ -94,6 +102,19 @@ export function buildTradeEmbed(params: {
     }
 
     return embed;
+}
+
+export function buildTradeAnnouncementContent(params: {
+    trade: TradeRecord;
+    userId: string;
+}): string {
+    const base = `New trade from <@${params.userId}>`;
+
+    if (params.trade.discount_percent !== null && params.trade.discounted_auec !== null) {
+        return `${base} — ${numberFormatter.format(params.trade.discounted_auec)} aUEC (${params.trade.discount_percent}% off)`;
+    }
+
+    return `${base} — ${numberFormatter.format(params.trade.auec)} aUEC`;
 }
 
 export function buildAnnouncementUrl(params: {
