@@ -108,6 +108,10 @@ export type UserRecord = {
     updated_at: string;
 };
 
+export const buy_order_status = ["open", "fulfilled", "cancelled"] as const;
+
+export type BuyOrderStatus = (typeof buy_order_status)[number];
+
 export type BuyOrderRecord = {
     id: number;
     guild_id: string;
@@ -118,6 +122,9 @@ export type BuyOrderRecord = {
     attachment_url: string | null;
     announcement_channel_id: string | null;
     announcement_message_id: string | null;
+    done_button_custom_id: string | null;
+    cancel_button_custom_id: string | null;
+    status: BuyOrderStatus;
     created_at: string;
     updated_at: string;
 };
@@ -284,6 +291,9 @@ export async function initializeDatabase(): Promise<void> {
             attachment_url TEXT,
             announcement_channel_id TEXT,
             announcement_message_id TEXT,
+            done_button_custom_id TEXT,
+            cancel_button_custom_id TEXT,
+            status TEXT NOT NULL CHECK (status IN ('open','fulfilled','cancelled')) DEFAULT 'open',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
@@ -451,6 +461,23 @@ export async function initializeDatabase(): Promise<void> {
 
     if (!tradeColumnNames.has("discounted_auec")) {
         db.run(`ALTER TABLE trades ADD COLUMN discounted_auec INTEGER`);
+    }
+
+    const buyColumns = db.prepare(`PRAGMA table_info(buy_orders)`).all() as { name: string }[];
+    const buyColumnNames = new Set(buyColumns.map((column) => column.name));
+
+    if (!buyColumnNames.has("status")) {
+        db.run(
+            `ALTER TABLE buy_orders ADD COLUMN status TEXT NOT NULL CHECK (status IN ('open','fulfilled','cancelled')) DEFAULT 'open'`,
+        );
+    }
+
+    if (!buyColumnNames.has("done_button_custom_id")) {
+        db.run(`ALTER TABLE buy_orders ADD COLUMN done_button_custom_id TEXT`);
+    }
+
+    if (!buyColumnNames.has("cancel_button_custom_id")) {
+        db.run(`ALTER TABLE buy_orders ADD COLUMN cancel_button_custom_id TEXT`);
     }
 }
 
@@ -946,6 +973,8 @@ export async function updateBuyOrderAnnouncementMetadata(params: {
     orderId: number;
     channelId?: string | null;
     messageId?: string | null;
+    doneButtonId?: string | null;
+    cancelButtonId?: string | null;
 }): Promise<void> {
     const updates: string[] = [];
     const queryParams: QueryParams = { orderId: params.orderId };
@@ -958,6 +987,16 @@ export async function updateBuyOrderAnnouncementMetadata(params: {
     if (params.messageId !== undefined) {
         updates.push("announcement_message_id = :messageId");
         queryParams.messageId = params.messageId ?? null;
+    }
+
+    if (params.doneButtonId !== undefined) {
+        updates.push("done_button_custom_id = :doneButtonId");
+        queryParams.doneButtonId = params.doneButtonId ?? null;
+    }
+
+    if (params.cancelButtonId !== undefined) {
+        updates.push("cancel_button_custom_id = :cancelButtonId");
+        queryParams.cancelButtonId = params.cancelButtonId ?? null;
     }
 
     if (updates.length === 0) {
@@ -982,6 +1021,15 @@ export async function getTradeById(tradeId: number): Promise<TradeRecord | null>
         SELECT * FROM trades WHERE id = :tradeId LIMIT 1
         `,
         { tradeId },
+    );
+}
+
+export async function getBuyOrderById(orderId: number): Promise<BuyOrderRecord | null> {
+    return get<BuyOrderRecord>(
+        `
+        SELECT * FROM buy_orders WHERE id = :orderId LIMIT 1
+        `,
+        { orderId },
     );
 }
 
@@ -1024,6 +1072,45 @@ export async function listTradesByUser(params: {
     );
 }
 
+export async function listBuyOrdersByUser(params: {
+    guildId: string;
+    userId: string;
+    status?: BuyOrderStatus;
+}): Promise<BuyOrderRecord[]> {
+    if (params.status && !buy_order_status.includes(params.status)) {
+        throw new Error(`Invalid buy order status: ${params.status}`);
+    }
+
+    if (params.status) {
+        return all<BuyOrderRecord>(
+            `
+            SELECT *
+            FROM buy_orders
+            WHERE guild_id = :guildId AND user_id = :userId AND status = :status
+            ORDER BY created_at DESC
+            `,
+            {
+                guildId: params.guildId,
+                userId: params.userId,
+                status: params.status,
+            },
+        );
+    }
+
+    return all<BuyOrderRecord>(
+        `
+        SELECT *
+        FROM buy_orders
+        WHERE guild_id = :guildId AND user_id = :userId
+        ORDER BY created_at DESC
+        `,
+        {
+            guildId: params.guildId,
+            userId: params.userId,
+        },
+    );
+}
+
 export async function getUserById(userId: string): Promise<UserRecord | null> {
     return get<UserRecord>(
         `
@@ -1055,6 +1142,29 @@ export async function updateTradeStatus(params: {
             tradeId: params.tradeId,
             status: params.status,
             reason: params.reason ?? null,
+        },
+    );
+}
+
+export async function updateBuyOrderStatus(params: {
+    orderId: number;
+    status: BuyOrderStatus;
+}): Promise<BuyOrderRecord | null> {
+    if (!buy_order_status.includes(params.status)) {
+        throw new Error(`Invalid buy order status: ${params.status}`);
+    }
+
+    return get<BuyOrderRecord>(
+        `
+        UPDATE buy_orders
+        SET status = :status,
+            updated_at = datetime('now')
+        WHERE id = :orderId
+        RETURNING *
+        `,
+        {
+            orderId: params.orderId,
+            status: params.status,
         },
     );
 }

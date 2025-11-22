@@ -6,6 +6,7 @@ import {
 } from "discord-interactions";
 
 import commands, { commandMap } from "./commands";
+import { handleBuyComponent } from "./commands/buy-component";
 import { handleTradeComponent } from "./commands/trade-component";
 import {
     ApplicationCommandType,
@@ -136,10 +137,26 @@ async function handleInteraction(request: Request): Promise<Response> {
 
     if (base?.type === InteractionType.MESSAGE_COMPONENT) {
         const interaction = payload as MessageComponentInteraction;
+        const customId = interaction.data?.custom_id ?? "";
 
         try {
-            const response = await handleTradeComponent({ interaction, config });
-            return jsonResponse(response);
+            if (customId.startsWith("buy:")) {
+                const response = await handleBuyComponent({ interaction, config });
+                return jsonResponse(response);
+            }
+
+            if (customId.startsWith("trade:")) {
+                const response = await handleTradeComponent({ interaction, config });
+                return jsonResponse(response);
+            }
+
+            return jsonResponse({
+                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                data: {
+                    content: "Unsupported component interaction.",
+                    flags: InteractionResponseFlags.EPHEMERAL,
+                },
+            });
         } catch (error) {
             console.error("Component interaction handler failed", error);
             return jsonResponse({

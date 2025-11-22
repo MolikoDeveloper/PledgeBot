@@ -1,0 +1,2167 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/commands/buy-component.ts b/commands/buy-component.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed5358c44f978137b3348164714697c9efc51bee
+--- /dev/null
++++ b/commands/buy-component.ts
+@@ -0,0 +1,373 @@
++import { InteractionResponseFlags, InteractionResponseType } from "discord-interactions";
++
++import {
++    getBuyOrderById,
++    getTradeConfig,
++    getUserById,
++    updateBuyOrderAnnouncementMetadata,
++    updateBuyOrderStatus,
++    type BuyOrderRecord,
++} from "../src/database";
++import type { AppConfig } from "../src/config";
++import {
++    buildAnnouncementUrl,
++    buildBuyOrderAnnouncementContent,
++    buildBuyOrderEmbed,
++    buildBuyThreadName,
++    patchTradeAnnouncement,
++    resolveBuyStatusLabel,
++    resolveForumThreadId,
++    resolveUserTag,
++    shouldArchiveBuyThread,
++    updateForumThread,
++} from "./trade-utils";
++import type { CommandResponse, MessageComponent, MessageComponentInteraction } from "./types";
++import { ButtonStyle, ComponentType } from "./types";
++
++function buildEphemeralResponse(content: string): CommandResponse {
++    return {
++        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
++        data: {
++            content,
++            flags: InteractionResponseFlags.EPHEMERAL,
++        },
++    };
++}
++
++function extractUserId(interaction: MessageComponentInteraction): string | null {
++    return interaction.member?.user?.id ?? interaction.user?.id ?? null;
++}
++
++async function clearBuyControls(orderId: number): Promise<Error | null> {
++    try {
++        await updateBuyOrderAnnouncementMetadata({
++            orderId,
++            doneButtonId: null,
++            cancelButtonId: null,
++        });
++        return null;
++    } catch (error) {
++        const err = error instanceof Error ? error : new Error("Unknown metadata update failure");
++        console.error(`Failed to clear buy component metadata for order #${orderId}`, error);
++        return err;
++    }
++}
++
++function buildActiveComponents(order: BuyOrderRecord): MessageComponent[] {
++    if (order.status !== "open") {
++        return [];
++    }
++
++    if (!order.done_button_custom_id || !order.cancel_button_custom_id) {
++        return [];
++    }
++
++    return [
++        {
++            type: ComponentType.ACTION_ROW,
++            components: [
++                {
++                    type: ComponentType.BUTTON,
++                    style: ButtonStyle.SUCCESS,
++                    label: "Mark done",
++                    custom_id: order.done_button_custom_id,
++                },
++                {
++                    type: ComponentType.BUTTON,
++                    style: ButtonStyle.DANGER,
++                    label: "Cancel",
++                    custom_id: order.cancel_button_custom_id,
++                },
++            ],
++        },
++    ];
++}
++
++async function syncBuyForumThread(params: {
++    config: AppConfig;
++    tradeConfig: Awaited<ReturnType<typeof getTradeConfig>>;
++    order: BuyOrderRecord;
++}): Promise<Error | null> {
++    if (params.config.allowOffline) {
++        return null;
++    }
++
++    const threadId = resolveForumThreadId({
++        announcementChannelId: params.order.announcement_channel_id,
++        tradeChannelId: params.tradeConfig.tradeChannelId,
++        tradeChannelType: params.tradeConfig.tradeChannelType,
++    });
++
++    if (!threadId) {
++        return null;
++    }
++
++    const archiveThread = shouldArchiveBuyThread(params.order.status);
++
++    try {
++        await updateForumThread({
++            token: params.config.botToken,
++            threadId,
++            name: buildBuyThreadName(params.order),
++            ...(archiveThread ? { archived: true, locked: true } : {}),
++        });
++        return null;
++    } catch (error) {
++        const err = error instanceof Error ? error : new Error("Unknown forum thread update failure.");
++        console.error(`Failed to update forum thread for buy order #${params.order.id}`, error);
++        return err;
++    }
++}
++
++async function handleDoneAction(params: {
++    interaction: MessageComponentInteraction;
++    config: AppConfig;
++    tradeConfig: Awaited<ReturnType<typeof getTradeConfig>>;
++    order: BuyOrderRecord | null;
++    customId: string;
++    userId: string;
++}): Promise<CommandResponse> {
++    const { interaction, config, tradeConfig, order, customId, userId } = params;
++
++    if (!order) {
++        return buildEphemeralResponse("Buy order not found.");
++    }
++
++    if (order.done_button_custom_id && order.done_button_custom_id !== customId) {
++        return buildEphemeralResponse("This buy order action is no longer valid.");
++    }
++
++    if (order.status === "fulfilled") {
++        return buildEphemeralResponse(`Buy order #${order.id} is already fulfilled.`);
++    }
++
++    if (order.status !== "open") {
++        const statusLabel = resolveBuyStatusLabel(order.status);
++        return buildEphemeralResponse(`Buy order #${order.id} is already ${statusLabel}.`);
++    }
++
++    const updated = await updateBuyOrderStatus({ orderId: order.id, status: "fulfilled" });
++    if (!updated) {
++        return buildEphemeralResponse("Failed to update the buy order. Try again in a moment.");
++    }
++
++    const metadataError = await clearBuyControls(order.id);
++
++    const storedUser = await getUserById(userId);
++    const userTag = resolveUserTag({
++        userRecord: storedUser,
++        interactionUser: interaction.member?.user ?? interaction.user ?? null,
++        fallbackId: userId,
++    });
++
++    const announcementUrl = buildAnnouncementUrl({
++        guildId: interaction.guild_id!,
++        channelId: updated.announcement_channel_id,
++        messageId: updated.announcement_message_id,
++    });
++
++    let announcementPatchError: Error | null = null;
++    let missingAnnouncementMetadata = false;
++    let threadUpdateError: Error | null = null;
++
++    if (!config.allowOffline) {
++        if (updated.announcement_channel_id && updated.announcement_message_id) {
++            try {
++                const embed = buildBuyOrderEmbed({ order: updated, userTag });
++                const announcementContent = buildBuyOrderAnnouncementContent({
++                    order: updated,
++                    userId: updated.user_id,
++                });
++
++                await patchTradeAnnouncement({
++                    token: config.botToken,
++                    channelId: updated.announcement_channel_id,
++                    messageId: updated.announcement_message_id,
++                    embed,
++                    content: announcementContent,
++                    components: [],
++                });
++            } catch (error) {
++                announcementPatchError =
++                    error instanceof Error ? error : new Error("Unknown announcement update failure.");
++                console.error(`Failed to patch buy order announcement for order #${order.id}`, error);
++            }
++        } else {
++            missingAnnouncementMetadata = true;
++        }
++    }
++
++    threadUpdateError = await syncBuyForumThread({ config, tradeConfig, order: updated });
++
++    const responseLines = [
++        `Buy order #${updated.id} marked as fulfilled.`,
++        announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
++        config.allowOffline ? "Offline mode: announcement was not updated." : undefined,
++        missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
++        announcementPatchError ? "Warning: Failed to update the buy order announcement." : undefined,
++        metadataError ? "Warning: Failed to update stored control metadata." : undefined,
++        threadUpdateError ? "Warning: Failed to update the buy order forum thread." : undefined,
++    ].filter(Boolean);
++
++    return buildEphemeralResponse(responseLines.join("\n"));
++}
++
++async function handleCancelAction(params: {
++    interaction: MessageComponentInteraction;
++    config: AppConfig;
++    tradeConfig: Awaited<ReturnType<typeof getTradeConfig>>;
++    order: BuyOrderRecord | null;
++    customId: string;
++    userId: string;
++}): Promise<CommandResponse> {
++    const { interaction, config, tradeConfig, order, customId, userId } = params;
++
++    if (!order) {
++        return buildEphemeralResponse("Buy order not found.");
++    }
++
++    if (order.cancel_button_custom_id && order.cancel_button_custom_id !== customId) {
++        return buildEphemeralResponse("This buy order action is no longer valid.");
++    }
++
++    if (order.status === "cancelled") {
++        return buildEphemeralResponse(`Buy order #${order.id} is already cancelled.`);
++    }
++
++    if (order.status !== "open") {
++        const statusLabel = resolveBuyStatusLabel(order.status);
++        return buildEphemeralResponse(`Buy order #${order.id} is already ${statusLabel}.`);
++    }
++
++    const updated = await updateBuyOrderStatus({ orderId: order.id, status: "cancelled" });
++    if (!updated) {
++        return buildEphemeralResponse("Failed to update the buy order status. Try again in a moment.");
++    }
++
++    const metadataError = await clearBuyControls(order.id);
++
++    const storedUser = await getUserById(userId);
++    const userTag = resolveUserTag({
++        userRecord: storedUser,
++        interactionUser: interaction.member?.user ?? interaction.user ?? null,
++        fallbackId: userId,
++    });
++
++    const announcementUrl = buildAnnouncementUrl({
++        guildId: interaction.guild_id!,
++        channelId: updated.announcement_channel_id,
++        messageId: updated.announcement_message_id,
++    });
++
++    let announcementPatchError: Error | null = null;
++    let missingAnnouncementMetadata = false;
++    let threadUpdateError: Error | null = null;
++
++    if (!config.allowOffline) {
++        if (updated.announcement_channel_id && updated.announcement_message_id) {
++            try {
++                const embed = buildBuyOrderEmbed({ order: updated, userTag, statusLabel: "Cancelled" });
++                const announcementContent = buildBuyOrderAnnouncementContent({
++                    order: updated,
++                    userId: updated.user_id,
++                });
++
++                await patchTradeAnnouncement({
++                    token: config.botToken,
++                    channelId: updated.announcement_channel_id,
++                    messageId: updated.announcement_message_id,
++                    embed,
++                    content: announcementContent,
++                    components: [],
++                });
++            } catch (error) {
++                announcementPatchError =
++                    error instanceof Error ? error : new Error("Unknown announcement update failure.");
++                console.error(`Failed to patch buy order announcement for order #${order.id}`, error);
++            }
++        } else {
++            missingAnnouncementMetadata = true;
++        }
++    }
++
++    threadUpdateError = await syncBuyForumThread({ config, tradeConfig, order: updated });
++
++    const responseLines = [
++        `Buy order #${updated.id} has been cancelled.`,
++        announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
++        config.allowOffline ? "Offline mode: announcement was not updated." : undefined,
++        missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
++        announcementPatchError ? "Warning: Failed to update the buy order announcement." : undefined,
++        metadataError ? "Warning: Failed to update stored control metadata." : undefined,
++        threadUpdateError ? "Warning: Failed to update the buy order forum thread." : undefined,
++    ].filter(Boolean);
++
++    return buildEphemeralResponse(responseLines.join("\n"));
++}
++
++export async function handleBuyComponent(params: {
++    interaction: MessageComponentInteraction;
++    config: AppConfig;
++}): Promise<CommandResponse> {
++    const { interaction, config } = params;
++
++    if (!interaction.data || !interaction.data.custom_id) {
++        return buildEphemeralResponse("Unsupported component interaction.");
++    }
++
++    if (!interaction.guild_id) {
++        return buildEphemeralResponse("Buy orders can only be managed inside a guild.");
++    }
++
++    const userId = extractUserId(interaction);
++    if (!userId) {
++        return buildEphemeralResponse("Unable to determine the user for this interaction.");
++    }
++
++    const parts = interaction.data.custom_id.split(":");
++    if (parts.length < 3 || parts[0] !== "buy") {
++        return buildEphemeralResponse("Unsupported buy order component.");
++    }
++
++    const orderId = Number.parseInt(parts[1] ?? "", 10);
++    const action = (parts[2] ?? "").toLowerCase();
++
++    if (!Number.isInteger(orderId) || orderId <= 0) {
++        return buildEphemeralResponse("Invalid buy order identifier.");
++    }
++
++    const order = await getBuyOrderById(orderId);
++    if (!order || order.guild_id !== interaction.guild_id) {
++        return buildEphemeralResponse(`Buy order #${orderId} does not exist for this guild.`);
++    }
++
++    if (order.user_id !== userId) {
++        return buildEphemeralResponse("Only the buyer can manage this order.");
++    }
++
++    const tradeConfig = await getTradeConfig(interaction.guild_id);
++
++    if (action === "done") {
++        return handleDoneAction({
++            interaction,
++            config,
++            tradeConfig,
++            order,
++            customId: interaction.data.custom_id,
++            userId,
++        });
++    }
++
++    if (action === "cancel") {
++        return handleCancelAction({
++            interaction,
++            config,
++            tradeConfig,
++            order,
++            customId: interaction.data.custom_id,
++            userId,
++        });
++    }
++
++    return buildEphemeralResponse("Unsupported buy order component action.");
++}
+diff --git a/commands/buy.ts b/commands/buy.ts
+index fb10d5c7b6249fc188715ba8a1d5120dd383e3e0..37fa412db60bc9e93f9903e60b989e82ca334905 100644
+--- a/commands/buy.ts
++++ b/commands/buy.ts
+@@ -1,258 +1,766 @@
+ import {
+     InteractionResponseFlags,
+     InteractionResponseType,
+ } from "discord-interactions";
+ 
+ import {
+     createBuyOrder,
++    getBuyOrderById,
+     getTradeConfig,
++    getUserById,
++    listBuyOrdersByUser,
+     recordGuild,
+     recordUser,
+     updateBuyOrderAnnouncementMetadata,
++    updateBuyOrderStatus,
++    type BuyOrderRecord,
+ } from "../src/database";
+ import {
+     ApplicationCommandOptionType,
++    ButtonStyle,
++    ComponentType,
+     type CommandData,
+     type CommandExecuteContext,
+     type CommandModule,
+     type CommandResponse,
+     type InteractionAttachment,
+     type InteractionDataOption,
++    type InteractionUser,
++    type MessageComponent,
+ } from "./types";
+ import {
+     buildAnnouncementUrl,
+     buildBuyOrderAnnouncementContent,
+     buildBuyOrderEmbed,
+     buildBuyThreadName,
+     deliverTradeAnnouncement,
++    patchTradeAnnouncement,
++    resolveBuyStatusLabel,
++    resolveForumThreadId,
+     resolveUserTag,
++    shouldArchiveBuyThread,
+     type AnnouncementResult,
++    updateForumThread,
+ } from "./trade-utils";
+ 
+ const commandData: CommandData = {
+     name: "buy",
+-    description: "Publish a buy order.",
++    description: "Manage buy orders.",
+     dm_permission: false,
+     options: [
+         {
+-            type: ApplicationCommandOptionType.STRING,
+-            name: "item",
+-            description: "Item or service you want to buy.",
+-            required: true,
++            type: ApplicationCommandOptionType.SUB_COMMAND,
++            name: "create",
++            description: "Publish a new buy order.",
++            options: [
++                {
++                    type: ApplicationCommandOptionType.STRING,
++                    name: "item",
++                    description: "Item or service you want to buy.",
++                    required: true,
++                },
++                {
++                    type: ApplicationCommandOptionType.INTEGER,
++                    name: "price",
++                    description: "Offered price in aUEC.",
++                    required: true,
++                    min_value: 1,
++                },
++                {
++                    type: ApplicationCommandOptionType.INTEGER,
++                    name: "amount",
++                    description: "Desired quantity (optional).",
++                    min_value: 1,
++                },
++                {
++                    type: ApplicationCommandOptionType.ATTACHMENT,
++                    name: "attachment",
++                    description: "Optional reference image.",
++                },
++            ],
+         },
+         {
+-            type: ApplicationCommandOptionType.INTEGER,
+-            name: "price",
+-            description: "Offered price in aUEC.",
+-            required: true,
+-            min_value: 1,
++            type: ApplicationCommandOptionType.SUB_COMMAND,
++            name: "done",
++            description: "Mark a buy order as fulfilled or close all of your open orders.",
++            options: [
++                {
++                    type: ApplicationCommandOptionType.STRING,
++                    name: "target",
++                    description: "Buy order ID to mark as done or 'todos' to mark every open order you created.",
++                    required: true,
++                },
++            ],
+         },
+         {
+-            type: ApplicationCommandOptionType.INTEGER,
+-            name: "amount",
+-            description: "Desired quantity (optional).",
+-            min_value: 1,
+-        },
+-        {
+-            type: ApplicationCommandOptionType.ATTACHMENT,
+-            name: "attachment",
+-            description: "Optional reference image.",
++            type: ApplicationCommandOptionType.SUB_COMMAND,
++            name: "cancel",
++            description: "Cancel one of your buy orders.",
++            options: [
++                {
++                    type: ApplicationCommandOptionType.INTEGER,
++                    name: "id",
++                    description: "Buy order ID to cancel.",
++                    required: true,
++                    min_value: 1,
++                },
++            ],
+         },
+     ],
+ };
+ 
+-function buildReply(content: string): CommandResponse {
++type OptionLookup = Record<string, InteractionDataOption>;
++type ExtractedSubcommand = { name: "create" | "done" | "cancel" | null; options: InteractionDataOption[] };
++type GuildTradeConfig = Awaited<ReturnType<typeof getTradeConfig>>;
++
++function buildReply(content: string, components?: MessageComponent[]): CommandResponse {
+     return {
+         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+         data: {
+             content,
+             flags: InteractionResponseFlags.EPHEMERAL,
++            ...(components ? { components } : {}),
+         },
+     };
+ }
+ 
+-function normalizeOptions(options: InteractionDataOption[] | undefined): Record<string, InteractionDataOption> {
++function normalizeOptions(options: InteractionDataOption[] | undefined): OptionLookup {
+     if (!options) {
+         return {};
+     }
+ 
+-    return options.reduce<Record<string, InteractionDataOption>>((acc, option) => {
++    return options.reduce<OptionLookup>((acc, option) => {
+         acc[option.name] = option;
+         return acc;
+     }, {});
+ }
+ 
+-function getStringOption(lookup: Record<string, InteractionDataOption>, name: string): string | null {
++function extractSubcommand(interaction: CommandExecuteContext["interaction"]): ExtractedSubcommand {
++    const options = interaction.data.options ?? [];
++    const [first] = options;
++
++    if (!first || first.type !== ApplicationCommandOptionType.SUB_COMMAND) {
++        return { name: null, options: [] };
++    }
++
++    return {
++        name: first.name as ExtractedSubcommand["name"],
++        options: first.options ?? [],
++    };
++}
++
++function buildControlComponents(params: { doneCustomId: string; cancelCustomId: string }): MessageComponent[] {
++    const buttons: MessageComponent["components"] = [
++        {
++            type: ComponentType.BUTTON,
++            style: ButtonStyle.SUCCESS,
++            label: "Mark done",
++            custom_id: params.doneCustomId,
++        },
++        {
++            type: ComponentType.BUTTON,
++            style: ButtonStyle.DANGER,
++            label: "Cancel",
++            custom_id: params.cancelCustomId,
++        },
++    ];
++
++    return [
++        {
++            type: ComponentType.ACTION_ROW,
++            components: buttons,
++        },
++    ];
++}
++
++function resolveBuyComponents(order: BuyOrderRecord): MessageComponent[] {
++    if (order.status !== "open") {
++        return [];
++    }
++
++    if (!order.done_button_custom_id || !order.cancel_button_custom_id) {
++        return [];
++    }
++
++    return buildControlComponents({
++        doneCustomId: order.done_button_custom_id,
++        cancelCustomId: order.cancel_button_custom_id,
++    });
++}
++
++function getStringOption(lookup: OptionLookup, name: string): string | null {
+     const option = lookup[name];
+     if (!option || typeof option.value !== "string") {
+         return null;
+     }
+     return option.value;
+ }
+ 
+-function getIntegerOption(lookup: Record<string, InteractionDataOption>, name: string): number | null {
++function getIntegerOption(lookup: OptionLookup, name: string): number | null {
+     const option = lookup[name];
+     if (!option || typeof option.value !== "number") {
+         return null;
+     }
+     return option.value;
+ }
+ 
+ function resolveImageUrl(attachment: InteractionAttachment | null): string | null {
+     if (!attachment) {
+         return null;
+     }
+ 
+     if (attachment.content_type && !attachment.content_type.startsWith("image/")) {
+         return null;
+     }
+ 
+     return attachment.url ?? null;
+ }
+ 
+-const buyCommand: CommandModule = {
+-    data: commandData,
+-    async execute({ interaction, config }: CommandExecuteContext): Promise<CommandResponse> {
+-        const guildId = interaction.guild_id;
+-        if (!guildId) {
+-            return buildReply("This command can only be used within a server.");
+-        }
++async function clearBuyControls(orderId: number): Promise<Error | null> {
++    try {
++        await updateBuyOrderAnnouncementMetadata({
++            orderId,
++            doneButtonId: null,
++            cancelButtonId: null,
++        });
++        return null;
++    } catch (error) {
++        const err = error instanceof Error ? error : new Error("Unknown metadata update failure");
++        console.error(`Failed to clear buy component metadata for order #${orderId}`, error);
++        return err;
++    }
++}
+ 
+-        const user = interaction.member?.user ?? interaction.user;
+-        if (!user) {
+-            return buildReply("Unable to resolve the user for this interaction.");
++function resolveForumThreadIdForOrder(order: BuyOrderRecord, tradeConfig: GuildTradeConfig): string | null {
++    return resolveForumThreadId({
++        announcementChannelId: order.announcement_channel_id,
++        tradeChannelId: tradeConfig.tradeChannelId,
++        tradeChannelType: tradeConfig.tradeChannelType,
++    });
++}
++
++async function syncBuyForumThread(params: {
++    config: CommandExecuteContext["config"];
++    tradeConfig: GuildTradeConfig;
++    order: BuyOrderRecord;
++}): Promise<Error | null> {
++    if (params.config.allowOffline) {
++        return null;
++    }
++
++    const threadId = resolveForumThreadIdForOrder(params.order, params.tradeConfig);
++    if (!threadId) {
++        return null;
++    }
++
++    const archiveThread = shouldArchiveBuyThread(params.order.status);
++
++    try {
++        await updateForumThread({
++            token: params.config.botToken,
++            threadId,
++            name: buildBuyThreadName(params.order),
++            ...(archiveThread ? { archived: true, locked: true } : {}),
++        });
++        return null;
++    } catch (error) {
++        const err = error instanceof Error ? error : new Error("Unknown forum thread update failure.");
++        console.error(`Failed to update forum thread for buy order #${params.order.id}`, error);
++        return err;
++    }
++}
++
++async function handleCreateSubcommand(params: {
++    interaction: CommandExecuteContext["interaction"];
++    config: CommandExecuteContext["config"];
++    options: InteractionDataOption[];
++    user: InteractionUser;
++}): Promise<CommandResponse> {
++    const { interaction, config, options, user } = params;
++    const guildId = interaction.guild_id!;
++
++    const lookup = normalizeOptions(options);
++    const item = getStringOption(lookup, "item")?.trim();
++    const priceOption = getIntegerOption(lookup, "price");
++    const amountOption = getIntegerOption(lookup, "amount");
++    const attachmentId = getStringOption(lookup, "attachment");
++    const attachment = attachmentId
++        ? interaction.data.resolved?.attachments?.[attachmentId] ?? null
++        : null;
++    const attachmentUrl = resolveImageUrl(attachment);
++
++    if (!item) {
++        return buildReply("Provide the item or service you want to buy.");
++    }
++
++    if (!priceOption || priceOption <= 0 || !Number.isInteger(priceOption)) {
++        return buildReply("Provide a valid price greater than 0.");
++    }
++
++    if (amountOption !== null && (amountOption <= 0 || !Number.isInteger(amountOption))) {
++        return buildReply("If provided, the amount must be a positive integer.");
++    }
++
++    await recordGuild(guildId, guildId);
++    await recordUser({
++        id: user.id,
++        username: user.username,
++        displayName: interaction.member?.nick ?? user.global_name ?? null,
++        discriminator: user.discriminator ?? null,
++    });
++
++    const tradeConfig = await getTradeConfig(guildId);
++    if (!tradeConfig.tradeChannelId || !tradeConfig.tradeChannelType) {
++        return buildReply("No trade channel configured. Ask an administrator to set one with /tradeconfig channel.");
++    }
++
++    const order = await createBuyOrder({
++        guildId,
++        userId: user.id,
++        item,
++        price: priceOption,
++        amount: amountOption,
++        attachmentUrl,
++    });
++
++    const doneCustomId = `buy:${order.id}:done`;
++    const cancelCustomId = `buy:${order.id}:cancel`;
++    const replyComponents = buildControlComponents({ doneCustomId, cancelCustomId });
++
++    let controlMetadataError: Error | null = null;
++    try {
++        await updateBuyOrderAnnouncementMetadata({
++            orderId: order.id,
++            doneButtonId: doneCustomId,
++            cancelButtonId: cancelCustomId,
++        });
++    } catch (error) {
++        controlMetadataError = error instanceof Error
++            ? error
++            : new Error("Unknown error while storing control metadata.");
++        console.error("Failed to store buy order control metadata", error);
++    }
++
++    const orderWithControls: BuyOrderRecord = {
++        ...order,
++        done_button_custom_id: doneCustomId,
++        cancel_button_custom_id: cancelCustomId,
++    };
++
++    const userTag = resolveUserTag({
++        interactionUser: user,
++        fallbackId: user.id,
++    });
++
++    const embed = buildBuyOrderEmbed({
++        order: orderWithControls,
++        userTag,
++        statusLabel: "Open",
++    });
++    const content = buildBuyOrderAnnouncementContent({ order: orderWithControls, userId: user.id });
++    const threadName = buildBuyThreadName(orderWithControls);
++
++    let announcementUrl: string | null = null;
++    let announcementError: Error | null = null;
++    let announcementMetadataError: Error | null = null;
++    let storedChannelId = order.announcement_channel_id;
++    let storedMessageId = order.announcement_message_id;
++
++    const configuredForumTags =
++        tradeConfig.tradeChannelType === "forum" ? tradeConfig.buyForumTagIds : [];
++    const appliedForumTags = configuredForumTags.length > 0 ? configuredForumTags : undefined;
++
++    if (!config.allowOffline) {
++        try {
++            const result: AnnouncementResult = await deliverTradeAnnouncement({
++                token: config.botToken,
++                guildId,
++                channelId: tradeConfig.tradeChannelId!,
++                channelType: tradeConfig.tradeChannelType!,
++                content,
++                threadName,
++                embed,
++                userId: user.id,
++                appliedTags: appliedForumTags,
++                components: replyComponents,
++            });
++            announcementUrl = result.url;
++
++            if (result.messageId && result.messageChannelId) {
++                try {
++                    await updateBuyOrderAnnouncementMetadata({
++                        orderId: order.id,
++                        channelId: result.messageChannelId,
++                        messageId: result.messageId,
++                    });
++                    storedChannelId = result.messageChannelId;
++                    storedMessageId = result.messageId;
++                } catch (error) {
++                    announcementMetadataError = error instanceof Error
++                        ? error
++                        : new Error("Unknown error while storing announcement metadata.");
++                    console.error("Failed to store buy order announcement metadata", error);
++                }
++            }
++        } catch (error) {
++            announcementError = error instanceof Error
++                ? error
++                : new Error("Unknown error while sending the buy order announcement.");
++            console.error("Failed to announce buy order", error);
+         }
++    }
++
++    const fallbackUrl = buildAnnouncementUrl({
++        guildId,
++        channelId: storedChannelId,
++        messageId: storedMessageId,
++    });
++
++    const announcementLink = announcementUrl ?? fallbackUrl;
++    const forumTagConfirmation =
++        appliedForumTags && !announcementError && !config.allowOffline
++            ? `Applied forum ${appliedForumTags.length === 1 ? "tag" : "tags"}: ${appliedForumTags.join(", ")}`
++            : undefined;
++
++    const responseLines = [
++        `Buy order #${order.id} created successfully.`,
++        announcementLink ? `Announcement: ${announcementLink}` : undefined,
++        forumTagConfirmation,
++        config.allowOffline ? "Offline mode: announcement was not sent." : undefined,
++        announcementError ? "Warning: Failed to post the buy order announcement." : undefined,
++        announcementMetadataError ? "Warning: Failed to store announcement metadata." : undefined,
++        controlMetadataError ? "Warning: Failed to store control metadata." : undefined,
++    ].filter(Boolean);
++
++    return buildReply(responseLines.join("\n"), replyComponents.length > 0 ? replyComponents : undefined);
++}
++
++async function handleDoneSubcommand(params: {
++    interaction: CommandExecuteContext["interaction"];
++    config: CommandExecuteContext["config"];
++    options: InteractionDataOption[];
++    user: InteractionUser;
++}): Promise<CommandResponse> {
++    const { interaction, config, options, user } = params;
++    const lookup = normalizeOptions(options);
++    const target = getStringOption(lookup, "target");
++
++    if (!target) {
++        return buildReply("Provide a buy order ID or 'todos'.");
++    }
+ 
+-        const options = interaction.data.options ?? [];
+-        const lookup = normalizeOptions(options);
+-        const itemOption = getStringOption(lookup, "item");
+-        const priceOption = getIntegerOption(lookup, "price");
+-        const amountOption = getIntegerOption(lookup, "amount");
+-        const attachmentId = getStringOption(lookup, "attachment");
+-        const attachment = attachmentId
+-            ? interaction.data.resolved?.attachments?.[attachmentId] ?? null
+-            : null;
+-        const attachmentUrl = resolveImageUrl(attachment);
+-
+-        const item = itemOption?.trim();
+-        if (!item) {
+-            return buildReply("Provide the item or service you want to buy.");
++    if (target.toLowerCase() === "todos") {
++        return handleDoneAllSubcommand({ interaction, config, user });
++    }
++
++    const orderId = Number.parseInt(target, 10);
++    if (!Number.isInteger(orderId) || orderId <= 0) {
++        return buildReply("Provide a valid buy order ID or 'todos'.");
++    }
++
++    const order = await getBuyOrderById(orderId);
++    if (!order || order.guild_id !== interaction.guild_id) {
++        return buildReply(`Buy order #${orderId} does not exist for this guild.`);
++    }
++
++    if (order.user_id !== user.id) {
++        return buildReply("You can only manage your own buy orders.");
++    }
++
++    if (order.status !== "open") {
++        const statusLabel = resolveBuyStatusLabel(order.status);
++        return buildReply(`Buy order #${order.id} is already ${statusLabel}.`);
++    }
++
++    const updated = await updateBuyOrderStatus({ orderId: order.id, status: "fulfilled" });
++    if (!updated) {
++        return buildReply(`Unable to mark buy order #${order.id} as done. Try again in a moment.`);
++    }
++
++    const tradeConfig = await getTradeConfig(interaction.guild_id!);
++    const storedUser = await getUserById(user.id);
++    const userTag = resolveUserTag({
++        userRecord: storedUser,
++        interactionUser: user,
++        fallbackId: user.id,
++    });
++
++    const embed = buildBuyOrderEmbed({ order: updated, userTag });
++    const announcementContent = buildBuyOrderAnnouncementContent({
++        order: updated,
++        userId: updated.user_id,
++    });
++    const announcementUrl = buildAnnouncementUrl({
++        guildId: interaction.guild_id!,
++        channelId: updated.announcement_channel_id,
++        messageId: updated.announcement_message_id,
++    });
++    const replyComponents = resolveBuyComponents(updated);
++
++    const metadataError = await clearBuyControls(updated.id);
++
++    let announcementPatchError: Error | null = null;
++    let missingAnnouncementMetadata = false;
++    let threadUpdateError: Error | null = null;
++
++    if (!config.allowOffline) {
++        if (updated.announcement_channel_id && updated.announcement_message_id) {
++            try {
++                await patchTradeAnnouncement({
++                    token: config.botToken,
++                    channelId: updated.announcement_channel_id,
++                    messageId: updated.announcement_message_id,
++                    embed,
++                    content: announcementContent,
++                    components: [],
++                });
++            } catch (error) {
++                announcementPatchError =
++                    error instanceof Error ? error : new Error("Unknown announcement update failure.");
++                console.error(`Failed to patch buy order announcement for order #${updated.id}`, error);
++            }
++        } else {
++            missingAnnouncementMetadata = true;
+         }
++    }
++
++    threadUpdateError = await syncBuyForumThread({ config, tradeConfig, order: updated });
++
++    const responseLines = [
++        `Marked buy order #${updated.id} as fulfilled.`,
++        announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
++        config.allowOffline ? "Offline mode: announcement was not updated." : undefined,
++        missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
++        announcementPatchError ? "Warning: Failed to update the buy order announcement." : undefined,
++        metadataError ? "Warning: Failed to update stored control metadata." : undefined,
++        threadUpdateError ? "Warning: Failed to update the buy order forum thread." : undefined,
++    ].filter(Boolean);
++
++    return buildReply(responseLines.join("\n"), replyComponents.length > 0 ? replyComponents : undefined);
++}
++
++async function handleDoneAllSubcommand(params: {
++    interaction: CommandExecuteContext["interaction"];
++    config: CommandExecuteContext["config"];
++    user: InteractionUser;
++}): Promise<CommandResponse> {
++    const { interaction, config, user } = params;
++    const guildId = interaction.guild_id!;
++
++    const openOrders = await listBuyOrdersByUser({
++        guildId,
++        userId: user.id,
++        status: "open",
++    });
++
++    if (openOrders.length === 0) {
++        return buildReply("You have no open buy orders to update.");
++    }
+ 
+-        if (!priceOption || priceOption <= 0 || !Number.isInteger(priceOption)) {
+-            return buildReply("Provide a valid price greater than 0.");
++    const tradeConfig = await getTradeConfig(guildId);
++    const storedUser = await getUserById(user.id);
++    const userTag = resolveUserTag({
++        userRecord: storedUser,
++        interactionUser: user,
++        fallbackId: user.id,
++    });
++
++    const updatedOrderIds: number[] = [];
++    const missingAnnouncementIds: number[] = [];
++    const patchFailures: number[] = [];
++    const metadataFailures: number[] = [];
++    const threadFailures: number[] = [];
++
++    for (const order of openOrders) {
++        const updated = await updateBuyOrderStatus({ orderId: order.id, status: "fulfilled" });
++        if (!updated) {
++            continue;
+         }
+ 
+-        if (amountOption !== null && (amountOption <= 0 || !Number.isInteger(amountOption))) {
+-            return buildReply("If provided, the amount must be a positive integer.");
++        updatedOrderIds.push(updated.id);
++
++        const metadataError = await clearBuyControls(updated.id);
++        if (metadataError) {
++            metadataFailures.push(updated.id);
+         }
+ 
+-        await recordGuild(guildId, guildId);
+-        await recordUser({
+-            id: user.id,
+-            username: user.username,
+-            displayName: interaction.member?.nick ?? user.global_name ?? null,
+-            discriminator: user.discriminator ?? null,
+-        });
++        if (!config.allowOffline) {
++            if (updated.announcement_channel_id && updated.announcement_message_id) {
++                try {
++                    const embed = buildBuyOrderEmbed({ order: updated, userTag });
++                    const announcementContent = buildBuyOrderAnnouncementContent({
++                        order: updated,
++                        userId: updated.user_id,
++                    });
+ 
+-        const tradeConfig = await getTradeConfig(guildId);
+-        if (!tradeConfig.tradeChannelId || !tradeConfig.tradeChannelType) {
+-            return buildReply("No trade channel configured. Ask an administrator to set one with /tradeconfig channel.");
++                    await patchTradeAnnouncement({
++                        token: config.botToken,
++                        channelId: updated.announcement_channel_id,
++                        messageId: updated.announcement_message_id,
++                        embed,
++                        content: announcementContent,
++                        components: [],
++                    });
++                } catch (error) {
++                    patchFailures.push(updated.id);
++                    console.error(`Failed to patch buy order announcement for order #${updated.id}`, error);
++                }
++            } else {
++                missingAnnouncementIds.push(updated.id);
++            }
+         }
+ 
+-        const order = await createBuyOrder({
+-            guildId,
+-            userId: user.id,
+-            item,
+-            price: priceOption,
+-            amount: amountOption,
+-            attachmentUrl,
+-        });
++        if (!config.allowOffline) {
++            const threadError = await syncBuyForumThread({ config, tradeConfig, order: updated });
++            if (threadError) {
++                threadFailures.push(updated.id);
++            }
++        }
++    }
+ 
+-        const userTag = resolveUserTag({
+-            interactionUser: user,
+-            fallbackId: user.id,
+-        });
++    const lines = [
++        `Marked ${updatedOrderIds.length} buy order${updatedOrderIds.length === 1 ? "" : "s"} as fulfilled.`,
++        updatedOrderIds.length ? `Orders: ${updatedOrderIds.map((id) => `#${id}`).join(", ")}` : undefined,
++        config.allowOffline ? "Offline mode: announcements were not updated." : undefined,
++        !config.allowOffline && missingAnnouncementIds.length > 0
++            ? `${missingAnnouncementIds.length} order${missingAnnouncementIds.length === 1 ? "" : "s"} did not have announcement metadata stored.`
++            : undefined,
++        patchFailures.length > 0
++            ? `Warning: Failed to update announcements for ${patchFailures.map((id) => `#${id}`).join(", ")}.`
++            : undefined,
++        metadataFailures.length > 0
++            ? `Warning: Failed to update stored control metadata for ${metadataFailures.map((id) => `#${id}`).join(", ")}.`
++            : undefined,
++        threadFailures.length > 0
++            ? `Warning: Failed to update forum threads for ${threadFailures.map((id) => `#${id}`).join(", ")}.`
++            : undefined,
++    ].filter(Boolean);
+ 
+-        const embed = buildBuyOrderEmbed({
+-            order,
+-            userTag,
+-        });
+-        const content = buildBuyOrderAnnouncementContent({ order, userId: user.id });
+-        const threadName = buildBuyThreadName(order);
++    return buildReply(lines.join("\n"));
++}
+ 
+-        let announcementUrl: string | null = null;
+-        let announcementError: Error | null = null;
+-        let announcementMetadataError: Error | null = null;
+-        let storedChannelId = order.announcement_channel_id;
+-        let storedMessageId = order.announcement_message_id;
++async function handleCancelSubcommand(params: {
++    interaction: CommandExecuteContext["interaction"];
++    config: CommandExecuteContext["config"];
++    options: InteractionDataOption[];
++    user: InteractionUser;
++}): Promise<CommandResponse> {
++    const { interaction, config, options, user } = params;
++    const lookup = normalizeOptions(options);
++    const orderId = getIntegerOption(lookup, "id");
+ 
+-        const configuredForumTags =
+-            tradeConfig.tradeChannelType === "forum" ? tradeConfig.buyForumTagIds : [];
+-        const appliedForumTags = configuredForumTags.length > 0 ? configuredForumTags : undefined;
++    if (!orderId || orderId <= 0) {
++        return buildReply("Provide a valid buy order ID to cancel.");
++    }
+ 
+-        if (!config.allowOffline) {
++    const order = await getBuyOrderById(orderId);
++    if (!order || order.guild_id !== interaction.guild_id) {
++        return buildReply(`Buy order #${orderId} does not exist for this guild.`);
++    }
++
++    if (order.user_id !== user.id) {
++        return buildReply("You can only manage your own buy orders.");
++    }
++
++    if (order.status !== "open") {
++        const statusLabel = resolveBuyStatusLabel(order.status);
++        return buildReply(`Buy order #${order.id} is already ${statusLabel}.`);
++    }
++
++    const updated = await updateBuyOrderStatus({ orderId: order.id, status: "cancelled" });
++    if (!updated) {
++        return buildReply("Failed to update the buy order status. Try again in a moment.");
++    }
++
++    const tradeConfig = await getTradeConfig(interaction.guild_id!);
++    const storedUser = await getUserById(user.id);
++    const userTag = resolveUserTag({
++        userRecord: storedUser,
++        interactionUser: user,
++        fallbackId: user.id,
++    });
++
++    const embed = buildBuyOrderEmbed({ order: updated, userTag, statusLabel: "Cancelled" });
++    const announcementContent = buildBuyOrderAnnouncementContent({
++        order: updated,
++        userId: updated.user_id,
++    });
++    const announcementUrl = buildAnnouncementUrl({
++        guildId: interaction.guild_id!,
++        channelId: updated.announcement_channel_id,
++        messageId: updated.announcement_message_id,
++    });
++
++    const metadataError = await clearBuyControls(updated.id);
++
++    let announcementPatchError: Error | null = null;
++    let missingAnnouncementMetadata = false;
++    let threadUpdateError: Error | null = null;
++
++    if (!config.allowOffline) {
++        if (updated.announcement_channel_id && updated.announcement_message_id) {
+             try {
+-                const result: AnnouncementResult = await deliverTradeAnnouncement({
++                await patchTradeAnnouncement({
+                     token: config.botToken,
+-                    guildId,
+-                    channelId: tradeConfig.tradeChannelId,
+-                    channelType: tradeConfig.tradeChannelType,
+-                    content,
+-                    threadName,
++                    channelId: updated.announcement_channel_id,
++                    messageId: updated.announcement_message_id,
+                     embed,
+-                    userId: user.id,
+-                    appliedTags: appliedForumTags,
++                    content: announcementContent,
++                    components: [],
+                 });
+-                announcementUrl = result.url;
+-
+-                if (result.messageId && result.messageChannelId) {
+-                    try {
+-                        await updateBuyOrderAnnouncementMetadata({
+-                            orderId: order.id,
+-                            channelId: result.messageChannelId,
+-                            messageId: result.messageId,
+-                        });
+-                        storedChannelId = result.messageChannelId;
+-                        storedMessageId = result.messageId;
+-                    } catch (error) {
+-                        announcementMetadataError = error instanceof Error
+-                            ? error
+-                            : new Error("Unknown error while storing announcement metadata.");
+-                        console.error("Failed to store buy order announcement metadata", error);
+-                    }
+-                }
+             } catch (error) {
+-                announcementError = error instanceof Error
+-                    ? error
+-                    : new Error("Unknown error while sending the buy order announcement.");
+-                console.error("Failed to announce buy order", error);
++                announcementPatchError =
++                    error instanceof Error ? error : new Error("Unknown announcement update failure.");
++                console.error(`Failed to patch buy order announcement for order #${updated.id}`, error);
+             }
++        } else {
++            missingAnnouncementMetadata = true;
+         }
++    }
+ 
+-        const fallbackUrl = buildAnnouncementUrl({
+-            guildId,
+-            channelId: storedChannelId,
+-            messageId: storedMessageId,
+-        });
++    threadUpdateError = await syncBuyForumThread({ config, tradeConfig, order: updated });
++
++    const responseLines = [
++        `Buy order #${updated.id} has been cancelled.`,
++        announcementUrl ? `Announcement: ${announcementUrl}` : undefined,
++        config.allowOffline ? "Offline mode: announcement was not updated." : undefined,
++        missingAnnouncementMetadata ? "No stored announcement message to update." : undefined,
++        announcementPatchError ? "Warning: Failed to update the buy order announcement." : undefined,
++        metadataError ? "Warning: Failed to update stored control metadata." : undefined,
++        threadUpdateError ? "Warning: Failed to update the buy order forum thread." : undefined,
++    ].filter(Boolean);
++
++    return buildReply(responseLines.join("\n"));
++}
++
++const buyCommand: CommandModule = {
++    data: commandData,
++    async execute({ interaction, config }: CommandExecuteContext): Promise<CommandResponse> {
++        if (!interaction.guild_id || !interaction.member) {
++            return buildReply("Buy orders can only be managed inside a guild.");
++        }
++
++        const user = interaction.member.user ?? interaction.user;
++        if (!user) {
++            return buildReply("Unable to resolve the user for this interaction.");
++        }
++
++        const { name: subcommandName, options } = extractSubcommand(interaction);
++
++        if (!subcommandName || subcommandName === "create") {
++            return handleCreateSubcommand({ interaction, config, options, user });
++        }
++
++        if (subcommandName === "done") {
++            return handleDoneSubcommand({ interaction, config, options, user });
++        }
++
++        if (subcommandName === "cancel") {
++            return handleCancelSubcommand({ interaction, config, options, user });
++        }
+ 
+-        const announcementLink = announcementUrl ?? fallbackUrl;
+-        const forumTagConfirmation =
+-            appliedForumTags && !announcementError && !config.allowOffline
+-                ? `Applied forum ${appliedForumTags.length === 1 ? "tag" : "tags"}: ${appliedForumTags.join(", ")}`
+-                : undefined;
+-
+-        const responseLines = [
+-            `Buy order #${order.id} created successfully.`,
+-            announcementLink ? `Announcement: ${announcementLink}` : undefined,
+-            forumTagConfirmation,
+-            config.allowOffline ? "Offline mode: announcement was not sent." : undefined,
+-            announcementError ? "Warning: Failed to post the buy order announcement." : undefined,
+-            announcementMetadataError ? "Warning: Failed to store announcement metadata." : undefined,
+-        ].filter(Boolean);
+-
+-        return buildReply(responseLines.join("\n"));
++        return buildReply("Unsupported subcommand for /buy.");
+     },
+ };
+ 
+ export default buyCommand;
+diff --git a/commands/trade-utils.ts b/commands/trade-utils.ts
+index bdda0fd3d9bffcb6c85dc9495308ca06ed1656b8..b05cd9a0ae088b3e22ab81f3d6c6465edc7e938f 100644
+--- a/commands/trade-utils.ts
++++ b/commands/trade-utils.ts
+@@ -1,62 +1,75 @@
+-import type { BuyOrderRecord, TradeRecord, TradeStatus, UserRecord } from "../src/database";
++import type { BuyOrderRecord, BuyOrderStatus, TradeRecord, TradeStatus, UserRecord } from "../src/database";
+ import type { MessageComponent } from "./types";
+ 
+ const numberFormatter = new Intl.NumberFormat("en-US");
+ const AUEC_EMOJI = "aUEC";
+ 
+ export type AnnouncementResult = {
+     url: string | null;
+     messageId: string | null;
+     messageChannelId: string | null;
+ };
+ 
+ export function formatAuecWithEmoji(amount: number): string {
+     return `${numberFormatter.format(amount)} ${AUEC_EMOJI}`;
+ }
+ 
+ export function resolveStatusLabel(status: TradeStatus): string {
+     switch (status) {
+         case "open":
+             return "Open";
+         case "complete":
+             return "Closed";
+         case "selled":
+             return "Sold";
+         case "cancelled":
+             return "Cancelled";
+         case "matched":
+             return "Matched";
+         case "escrow":
+             return "In Escrow";
+         case "expired":
+             return "Expired";
+         default:
+             return status;
+     }
+ }
+ 
++export function resolveBuyStatusLabel(status: BuyOrderStatus): string {
++    switch (status) {
++        case "open":
++            return "Open";
++        case "fulfilled":
++            return "Fulfilled";
++        case "cancelled":
++            return "Cancelled";
++        default:
++            return status;
++    }
++}
++
+ function formatUserTag(params: {
+     username?: string | null;
+     discriminator?: string | null;
+     fallbackId: string;
+ }): string {
+     const { username, discriminator, fallbackId } = params;
+     if (username && username.trim().length > 0) {
+         if (discriminator && discriminator !== "0") {
+             return `${username}#${discriminator}`;
+         }
+         return username;
+     }
+     return fallbackId;
+ }
+ 
+ export function resolveUserTag(params: {
+     userRecord?: Pick<UserRecord, "username" | "discriminator"> | null;
+     interactionUser?: { username: string; discriminator?: string | null } | null;
+     fallbackId: string;
+ }): string {
+     if (params.userRecord) {
+         return formatUserTag({
+             username: params.userRecord.username,
+             discriminator: params.userRecord.discriminator,
+             fallbackId: params.fallbackId,
+@@ -123,69 +136,85 @@ export function buildTradeAnnouncementContent(params: {
+ 
+     if (params.trade.discount_percent !== null && params.trade.discounted_auec !== null) {
+         return `${base} — ${numberFormatter.format(params.trade.discounted_auec)} aUEC (${params.trade.discount_percent}% off)`;
+     }
+ 
+     return `${base} — ${numberFormatter.format(params.trade.auec)} aUEC`;
+ }
+ 
+ export function buildSellThreadName(trade: TradeRecord): string {
+     const price = trade.discounted_auec ?? trade.auec;
+     const baseName = `Sell: ${trade.title} - ${formatAuecWithEmoji(price)}`;
+ 
+     if (trade.status === "selled" || trade.status === "complete") {
+         const statusLabel = resolveStatusLabel(trade.status);
+         return `✅ ${baseName} (${statusLabel})`;
+     }
+ 
+     if (trade.status !== "open") {
+         const statusLabel = resolveStatusLabel(trade.status);
+         return `${baseName} (${statusLabel})`;
+     }
+ 
+     return baseName;
+ }
+ 
+-export function buildBuyThreadName(order: Pick<BuyOrderRecord, "item" | "price">): string {
+-    return `Buy: ${order.item} - ${formatAuecWithEmoji(order.price)}`;
++export function buildBuyThreadName(order: Pick<BuyOrderRecord, "item" | "price" | "status">): string {
++    const baseName = `Buy: ${order.item} - ${formatAuecWithEmoji(order.price)}`;
++
++    if (order.status === "fulfilled") {
++        return `✅ ${baseName} (Fulfilled)`;
++    }
++
++    if (order.status === "cancelled") {
++        return `✖️ ${baseName} (Cancelled)`;
++    }
++
++    return baseName;
+ }
+ 
+ export function buildBuyOrderEmbed(params: {
+     order: BuyOrderRecord;
+     userTag: string;
++    statusLabel?: string;
+ }): Record<string, unknown> {
+     const { order, userTag } = params;
++    const statusLabel = params.statusLabel ?? resolveBuyStatusLabel(order.status);
+ 
+     const fields: Array<{ name: string; value: string; inline?: boolean }> = [
+         { name: "Price", value: `${numberFormatter.format(order.price)} aUEC`, inline: true },
+         { name: "Order ID", value: `#${order.id}`, inline: true },
+     ];
+ 
+     if (order.amount !== null) {
+         fields.splice(1, 0, { name: "Desired Amount", value: `${order.amount}`, inline: true });
+     }
+ 
++    if (statusLabel) {
++        fields.push({ name: "Status", value: statusLabel, inline: true });
++    }
++
+     const embed: Record<string, unknown> = {
+         title: `Looking to buy: ${order.item}`,
+         color: 0x1d4ed8,
+         fields,
+         timestamp: new Date(order.created_at).toISOString(),
+         footer: { text: `Buyer: ${userTag}` },
+     };
+ 
+     if (order.attachment_url) {
+         embed.image = { url: order.attachment_url };
+     }
+ 
+     return embed;
+ }
+ 
+ export function buildBuyOrderAnnouncementContent(params: {
+     order: BuyOrderRecord;
+     userId: string;
+ }): string {
+     const base = `New buy order from <@${params.userId}>`;
+ 
+     if (params.order.amount !== null) {
+         return `${base} — Offering ${numberFormatter.format(params.order.price)} aUEC for ${params.order.amount} unit(s)`;
+     }
+ 
+@@ -206,50 +235,54 @@ export function buildAnnouncementUrl(params: {
+ 
+ export function resolveForumThreadId(params: {
+     announcementChannelId: string | null;
+     tradeChannelId: string | null;
+     tradeChannelType: "forum" | "text" | null;
+ }): string | null {
+     if (!params.announcementChannelId) {
+         return null;
+     }
+ 
+     if (params.tradeChannelType !== "forum") {
+         return null;
+     }
+ 
+     if (params.tradeChannelId && params.announcementChannelId === params.tradeChannelId) {
+         return null;
+     }
+ 
+     return params.announcementChannelId;
+ }
+ 
+ export function shouldArchiveSellThread(status: TradeStatus): boolean {
+     return status === "selled" || status === "complete" || status === "cancelled";
+ }
+ 
++export function shouldArchiveBuyThread(status: BuyOrderStatus): boolean {
++    return status === "fulfilled" || status === "cancelled";
++}
++
+ export async function updateForumThread(params: {
+     token: string;
+     threadId: string;
+     name?: string;
+     archived?: boolean;
+     locked?: boolean;
+ }): Promise<void> {
+     const payload: Record<string, unknown> = {};
+ 
+     if (typeof params.name === "string") {
+         payload.name = params.name;
+     }
+ 
+     if (typeof params.archived === "boolean") {
+         payload.archived = params.archived;
+     }
+ 
+     if (typeof params.locked === "boolean") {
+         payload.locked = params.locked;
+     }
+ 
+     if (Object.keys(payload).length === 0) {
+         return;
+     }
+ 
+@@ -291,92 +324,95 @@ export async function patchTradeAnnouncement(params: {
+     const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/messages/${params.messageId}`, {
+         method: "PATCH",
+         headers: {
+             Authorization: `Bot ${params.token}`,
+             "Content-Type": "application/json",
+         },
+         body: JSON.stringify(payload),
+     });
+ 
+     if (!response.ok) {
+         const message = await response.text();
+         throw new Error(`Failed to update trade announcement: ${response.status} ${message}`);
+     }
+ }
+ 
+ export async function deliverTradeAnnouncement(params: {
+     token: string;
+     guildId: string;
+     channelId: string;
+     channelType: "text" | "forum";
+     content: string;
+     threadName: string;
+     embed: Record<string, unknown>;
+     userId: string;
+     appliedTags?: string[];
++    components?: MessageComponent[];
+ }): Promise<AnnouncementResult> {
+     const baseHeaders = {
+         Authorization: `Bot ${params.token}`,
+         "Content-Type": "application/json",
+     } satisfies Record<string, string>;
+ 
+     const allowedMentions = {
+         parse: [] as string[],
+         users: [params.userId],
+     };
+ 
+     if (params.channelType === "text") {
+         const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/messages`, {
+             method: "POST",
+             headers: baseHeaders,
+             body: JSON.stringify({
+                 content: params.content,
+                 embeds: [params.embed],
++                ...(params.components ? { components: params.components } : {}),
+                 allowed_mentions: allowedMentions,
+             }),
+         });
+ 
+         if (!response.ok) {
+             const message = await response.text();
+             throw new Error(`Failed to post trade announcement: ${response.status} ${message}`);
+         }
+ 
+         const messageData = (await response.json()) as { id?: string | null };
+         const messageId = messageData.id ?? null;
+         return {
+             url: messageId ? `https://discord.com/channels/${params.guildId}/${params.channelId}/${messageId}` : null,
+             messageId,
+             messageChannelId: messageId ? params.channelId : null,
+         };
+     }
+ 
+     const buildThreadPayload = (appliedTags?: string[]): Record<string, unknown> => {
+         const payload: Record<string, unknown> = {
+             name: params.threadName,
+             message: {
+                 content: params.content,
+                 embeds: [params.embed],
++                ...(params.components ? { components: params.components } : {}),
+                 allowed_mentions: allowedMentions,
+             },
+         };
+ 
+         if (appliedTags && appliedTags.length > 0) {
+             payload.applied_tags = appliedTags;
+         }
+ 
+         return payload;
+     };
+ 
+     let appliedTags = params.appliedTags;
+ 
+     for (let attempt = 0; attempt < 2; attempt += 1) {
+         const response = await fetch(`https://discord.com/api/v10/channels/${params.channelId}/threads`, {
+             method: "POST",
+             headers: baseHeaders,
+             body: JSON.stringify(buildThreadPayload(appliedTags)),
+         });
+ 
+         if (response.ok) {
+             const threadData = (await response.json()) as {
+                 id?: string | null;
+                 message?: { id?: string | null } | null;
+             };
+diff --git a/server.ts b/server.ts
+index 647a04e4a8649bebfd0967f54319471c75b82166..6db42c5258d8fb8f956ef3e51cf4e87afe3cb6c5 100644
+--- a/server.ts
++++ b/server.ts
+@@ -1,33 +1,34 @@
+ import {
+     InteractionResponseFlags,
+     InteractionResponseType,
+     InteractionType,
+     verifyKey,
+ } from "discord-interactions";
+ 
+ import commands, { commandMap } from "./commands";
++import { handleBuyComponent } from "./commands/buy-component";
+ import { handleTradeComponent } from "./commands/trade-component";
+ import {
+     ApplicationCommandType,
+     type ChatInputCommandInteraction,
+     type CommandResponse,
+     type MessageComponentInteraction,
+ } from "./commands/types";
+ import { config } from "./src/config";
+ import { initializeDatabase } from "./src/database";
+ 
+ const port = Number(process.env.PORT ?? 4567);
+ const decoder = new TextDecoder();
+ 
+ async function syncCommands(): Promise<void> {
+     if (config.allowOffline) {
+         console.info("Skipping command sync because offline mode is enabled.");
+         return;
+     }
+ 
+     const payload = commands.map((command) => ({
+         ...command.data,
+         type: command.data.type ?? ApplicationCommandType.CHAT_INPUT,
+     }));
+ 
+     const baseUrl = `https://discord.com/api/v10/applications/${config.clientId}`;
+@@ -114,54 +115,70 @@ async function handleInteraction(request: Request): Promise<Response> {
+ 
+     const rawBody = new Uint8Array(await request.arrayBuffer());
+ 
+     const isValid = await verifyKey(rawBody, signature, timestamp, config.publicKey);
+ 
+     if (!isValid) {
+         return new Response("Bad request signature", { status: 401 });
+     }
+ 
+     let payload: unknown;
+     try {
+         payload = JSON.parse(decoder.decode(rawBody));
+     } catch (error) {
+         console.error("Failed to parse interaction payload", error);
+         return new Response("Invalid JSON", { status: 400 });
+     }
+ 
+     const base = payload as { type?: number } | undefined;
+ 
+     if (base?.type === InteractionType.PING) {
+         return jsonResponse({ type: InteractionResponseType.PONG });
+     }
+ 
+     if (base?.type === InteractionType.MESSAGE_COMPONENT) {
+         const interaction = payload as MessageComponentInteraction;
++        const customId = interaction.data?.custom_id ?? "";
+ 
+         try {
+-            const response = await handleTradeComponent({ interaction, config });
+-            return jsonResponse(response);
++            if (customId.startsWith("buy:")) {
++                const response = await handleBuyComponent({ interaction, config });
++                return jsonResponse(response);
++            }
++
++            if (customId.startsWith("trade:")) {
++                const response = await handleTradeComponent({ interaction, config });
++                return jsonResponse(response);
++            }
++
++            return jsonResponse({
++                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
++                data: {
++                    content: "Unsupported component interaction.",
++                    flags: InteractionResponseFlags.EPHEMERAL,
++                },
++            });
+         } catch (error) {
+             console.error("Component interaction handler failed", error);
+             return jsonResponse({
+                 type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                 data: {
+                     content: "An unexpected error occurred while processing the component interaction.",
+                     flags: InteractionResponseFlags.EPHEMERAL,
+                 },
+             });
+         }
+     }
+ 
+     if (base?.type !== InteractionType.APPLICATION_COMMAND) {
+         return jsonResponse({
+             type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+             data: {
+                 content: "Unsupported interaction type.",
+                 flags: InteractionResponseFlags.EPHEMERAL,
+             },
+         });
+     }
+ 
+     const interaction = payload as ChatInputCommandInteraction;
+ 
+     const commandName = interaction.data?.name;
+diff --git a/src/database.ts b/src/database.ts
+index 7e893d09d55d6d3518915e2d5e43148aae009954..4f234902e6d1b458b15a56d13dcf558f38c43efb 100644
+--- a/src/database.ts
++++ b/src/database.ts
+@@ -86,60 +86,67 @@ export type TradeRecord = {
+     auec: number;
+     discount_percent: number | null;
+     discounted_auec: number | null;
+     stock: number;
+     image_url: string | null;
+     announcement_channel_id: string | null;
+     announcement_message_id: string | null;
+     done_one_button_custom_id: string | null;
+     done_all_button_custom_id: string | null;
+     cancel_button_custom_id: string | null;
+     status: TradeStatus;
+     reason: string | null;
+     created_at: string;
+     updated_at: string;
+ };
+ 
+ export type UserRecord = {
+     id: string;
+     username: string;
+     display_name: string | null;
+     discriminator: string | null;
+     created_at: string;
+     updated_at: string;
+ };
+ 
++export const buy_order_status = ["open", "fulfilled", "cancelled"] as const;
++
++export type BuyOrderStatus = (typeof buy_order_status)[number];
++
+ export type BuyOrderRecord = {
+     id: number;
+     guild_id: string;
+     user_id: string;
+     item: string;
+     price: number;
+     amount: number | null;
+     attachment_url: string | null;
+     announcement_channel_id: string | null;
+     announcement_message_id: string | null;
++    done_button_custom_id: string | null;
++    cancel_button_custom_id: string | null;
++    status: BuyOrderStatus;
+     created_at: string;
+     updated_at: string;
+ };
+ 
+ export async function initializeDatabase(): Promise<void> {
+     db.run("PRAGMA journal_mode = WAL;");
+     db.run("PRAGMA foreign_keys = ON;");
+ 
+     db.run(`
+         CREATE TABLE IF NOT EXISTS guilds (
+             id TEXT PRIMARY KEY,
+             name TEXT NOT NULL,
+             admin_role_id TEXT,
+             trade_channel_id TEXT,
+             trade_channel_type TEXT CHECK (trade_channel_type IN ('forum','text')),
+             sell_forum_tag_id TEXT,
+             buy_forum_tag_id TEXT,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+         )
+     `);
+ 
+     const guildColumns = db.prepare(`PRAGMA table_info(guilds)`).all() as { name: string }[];
+     const guildColumnNames = new Set(guildColumns.map((column) => column.name));
+ 
+@@ -262,50 +269,53 @@ export async function initializeDatabase(): Promise<void> {
+             announcement_channel_id TEXT,
+             announcement_message_id TEXT,
+             done_one_button_custom_id TEXT,
+             done_all_button_custom_id TEXT,
+             cancel_button_custom_id TEXT,
+             status TEXT NOT NULL CHECK (status IN ('open','matched','escrow','complete','selled','cancelled','expired')),
+             reason TEXT,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+             FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
+             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+         )
+     `);
+ 
+     db.run(`
+         CREATE TABLE IF NOT EXISTS buy_orders (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             guild_id TEXT NOT NULL,
+             user_id TEXT NOT NULL,
+             item TEXT NOT NULL,
+             price INTEGER NOT NULL,
+             amount INTEGER,
+             attachment_url TEXT,
+             announcement_channel_id TEXT,
+             announcement_message_id TEXT,
++            done_button_custom_id TEXT,
++            cancel_button_custom_id TEXT,
++            status TEXT NOT NULL CHECK (status IN ('open','fulfilled','cancelled')) DEFAULT 'open',
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+             FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
+             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+         )
+     `);
+ 
+     db.run(`
+         CREATE TABLE IF NOT EXISTS command_history (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             guild_id TEXT,
+             user_id TEXT,
+             command_name TEXT NOT NULL,
+             options_json TEXT,
+             created_at TEXT NOT NULL DEFAULT (datetime('now'))
+         )
+     `);
+ 
+     let tradeColumns = db.prepare(`PRAGMA table_info(trades)`).all() as { name: string }[];
+     let tradeColumnNames = new Set(tradeColumns.map((column) => column.name));
+ 
+     const tradesTableDefinition = db
+         .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'trades'`)
+         .get() as { sql: string | null } | undefined;
+ 
+@@ -430,50 +440,67 @@ export async function initializeDatabase(): Promise<void> {
+     }
+ 
+     if (!tradeColumnNames.has("done_one_button_custom_id")) {
+         if (tradeColumnNames.has("close_button_custom_id")) {
+             db.run(`ALTER TABLE trades RENAME COLUMN close_button_custom_id TO done_one_button_custom_id`);
+         } else {
+             db.run(`ALTER TABLE trades ADD COLUMN done_one_button_custom_id TEXT`);
+         }
+     }
+ 
+     if (!tradeColumnNames.has("done_all_button_custom_id")) {
+         db.run(`ALTER TABLE trades ADD COLUMN done_all_button_custom_id TEXT`);
+     }
+ 
+     if (!tradeColumnNames.has("cancel_button_custom_id")) {
+         db.run(`ALTER TABLE trades ADD COLUMN cancel_button_custom_id TEXT`);
+     }
+ 
+     if (!tradeColumnNames.has("discount_percent")) {
+         db.run(`ALTER TABLE trades ADD COLUMN discount_percent INTEGER CHECK (discount_percent BETWEEN 0 AND 95)`);
+     }
+ 
+     if (!tradeColumnNames.has("discounted_auec")) {
+         db.run(`ALTER TABLE trades ADD COLUMN discounted_auec INTEGER`);
+     }
++
++    const buyColumns = db.prepare(`PRAGMA table_info(buy_orders)`).all() as { name: string }[];
++    const buyColumnNames = new Set(buyColumns.map((column) => column.name));
++
++    if (!buyColumnNames.has("status")) {
++        db.run(
++            `ALTER TABLE buy_orders ADD COLUMN status TEXT NOT NULL CHECK (status IN ('open','fulfilled','cancelled')) DEFAULT 'open'`,
++        );
++    }
++
++    if (!buyColumnNames.has("done_button_custom_id")) {
++        db.run(`ALTER TABLE buy_orders ADD COLUMN done_button_custom_id TEXT`);
++    }
++
++    if (!buyColumnNames.has("cancel_button_custom_id")) {
++        db.run(`ALTER TABLE buy_orders ADD COLUMN cancel_button_custom_id TEXT`);
++    }
+ }
+ 
+ export async function recordGuild(guildId: string, name: string | null | undefined, adminRoleId?: string | null): Promise<void> {
+     const resolvedName = typeof name === "string" && name.trim().length > 0 ? name : guildId;
+ 
+     run(
+         `
+         INSERT INTO guilds (id, name, admin_role_id)
+         VALUES (:id, :name, :adminRoleId)
+         ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name,
+             admin_role_id = COALESCE(excluded.admin_role_id, guilds.admin_role_id),
+             updated_at = datetime('now')
+         `,
+         {
+             id: guildId,
+             name: resolvedName,
+             adminRoleId: adminRoleId ?? null,
+         },
+     );
+ }
+ 
+ export async function recordUser(params: {
+     id: string;
+     username: string;
+@@ -924,163 +951,246 @@ export async function updateTradeAnnouncementMetadata(params: {
+     if (params.cancelButtonId !== undefined) {
+         updates.push("cancel_button_custom_id = :cancelButtonId");
+         queryParams.cancelButtonId = params.cancelButtonId ?? null;
+     }
+ 
+     if (updates.length === 0) {
+         return;
+     }
+ 
+     updates.push("updated_at = datetime('now')");
+ 
+     run(
+         `
+         UPDATE trades
+         SET ${updates.join(",\n            ")}
+         WHERE id = :tradeId
+         `,
+         queryParams,
+     );
+ }
+ 
+ export async function updateBuyOrderAnnouncementMetadata(params: {
+     orderId: number;
+     channelId?: string | null;
+     messageId?: string | null;
++    doneButtonId?: string | null;
++    cancelButtonId?: string | null;
+ }): Promise<void> {
+     const updates: string[] = [];
+     const queryParams: QueryParams = { orderId: params.orderId };
+ 
+     if (params.channelId !== undefined) {
+         updates.push("announcement_channel_id = :channelId");
+         queryParams.channelId = params.channelId ?? null;
+     }
+ 
+     if (params.messageId !== undefined) {
+         updates.push("announcement_message_id = :messageId");
+         queryParams.messageId = params.messageId ?? null;
+     }
+ 
++    if (params.doneButtonId !== undefined) {
++        updates.push("done_button_custom_id = :doneButtonId");
++        queryParams.doneButtonId = params.doneButtonId ?? null;
++    }
++
++    if (params.cancelButtonId !== undefined) {
++        updates.push("cancel_button_custom_id = :cancelButtonId");
++        queryParams.cancelButtonId = params.cancelButtonId ?? null;
++    }
++
+     if (updates.length === 0) {
+         return;
+     }
+ 
+     updates.push("updated_at = datetime('now')");
+ 
+     run(
+         `
+         UPDATE buy_orders
+         SET ${updates.join(",\n            ")}
+         WHERE id = :orderId
+         `,
+         queryParams,
+     );
+ }
+ 
+ export async function getTradeById(tradeId: number): Promise<TradeRecord | null> {
+     return get<TradeRecord>(
+         `
+         SELECT * FROM trades WHERE id = :tradeId LIMIT 1
+         `,
+         { tradeId },
+     );
+ }
+ 
++export async function getBuyOrderById(orderId: number): Promise<BuyOrderRecord | null> {
++    return get<BuyOrderRecord>(
++        `
++        SELECT * FROM buy_orders WHERE id = :orderId LIMIT 1
++        `,
++        { orderId },
++    );
++}
++
+ export async function listTradesByUser(params: {
+     guildId: string;
+     userId: string;
+     status?: TradeStatus;
+ }): Promise<TradeRecord[]> {
+     if (params.status && !trade_status.includes(params.status)) {
+         throw new Error(`Invalid trade status: ${params.status}`);
+     }
+ 
+     if (params.status) {
+         return all<TradeRecord>(
+             `
+             SELECT *
+             FROM trades
+             WHERE guild_id = :guildId AND user_id = :userId AND status = :status
+             ORDER BY created_at DESC
+             `,
+             {
+                 guildId: params.guildId,
+                 userId: params.userId,
+                 status: params.status,
+             },
+         );
+     }
+ 
+     return all<TradeRecord>(
+         `
+         SELECT *
+         FROM trades
+         WHERE guild_id = :guildId AND user_id = :userId
+         ORDER BY created_at DESC
+         `,
+         {
+             guildId: params.guildId,
+             userId: params.userId,
+         },
+     );
+ }
+ 
++export async function listBuyOrdersByUser(params: {
++    guildId: string;
++    userId: string;
++    status?: BuyOrderStatus;
++}): Promise<BuyOrderRecord[]> {
++    if (params.status && !buy_order_status.includes(params.status)) {
++        throw new Error(`Invalid buy order status: ${params.status}`);
++    }
++
++    if (params.status) {
++        return all<BuyOrderRecord>(
++            `
++            SELECT *
++            FROM buy_orders
++            WHERE guild_id = :guildId AND user_id = :userId AND status = :status
++            ORDER BY created_at DESC
++            `,
++            {
++                guildId: params.guildId,
++                userId: params.userId,
++                status: params.status,
++            },
++        );
++    }
++
++    return all<BuyOrderRecord>(
++        `
++        SELECT *
++        FROM buy_orders
++        WHERE guild_id = :guildId AND user_id = :userId
++        ORDER BY created_at DESC
++        `,
++        {
++            guildId: params.guildId,
++            userId: params.userId,
++        },
++    );
++}
++
+ export async function getUserById(userId: string): Promise<UserRecord | null> {
+     return get<UserRecord>(
+         `
+         SELECT * FROM users WHERE id = :userId LIMIT 1
+         `,
+         { userId },
+     );
+ }
+ 
+ export async function updateTradeStatus(params: {
+     tradeId: number;
+     status: TradeStatus;
+     reason?: string | null;
+ }): Promise<TradeRecord | null> {
+     if (!trade_status.includes(params.status)) {
+         throw new Error(`Invalid trade status: ${params.status}`);
+     }
+ 
+     return get<TradeRecord>(
+         `
+         UPDATE trades
+         SET status = :status,
+             reason = :reason,
+             updated_at = datetime('now')
+         WHERE id = :tradeId
+         RETURNING *
+         `,
+         {
+             tradeId: params.tradeId,
+             status: params.status,
+             reason: params.reason ?? null,
+         },
+     );
+ }
+ 
++export async function updateBuyOrderStatus(params: {
++    orderId: number;
++    status: BuyOrderStatus;
++}): Promise<BuyOrderRecord | null> {
++    if (!buy_order_status.includes(params.status)) {
++        throw new Error(`Invalid buy order status: ${params.status}`);
++    }
++
++    return get<BuyOrderRecord>(
++        `
++        UPDATE buy_orders
++        SET status = :status,
++            updated_at = datetime('now')
++        WHERE id = :orderId
++        RETURNING *
++        `,
++        {
++            orderId: params.orderId,
++            status: params.status,
++        },
++    );
++}
++
+ export async function reduceTradeStock(params: {
+     tradeId: number;
+     amount: number;
+ }): Promise<TradeRecord | null> {
+     if (!Number.isInteger(params.amount) || params.amount <= 0) {
+         throw new Error("Amount must be a positive integer");
+     }
+ 
+     return get<TradeRecord>(
+         `
+         UPDATE trades
+         SET stock = stock - :amount,
+             status = CASE WHEN stock - :amount <= 0 THEN 'selled' ELSE status END,
+             updated_at = datetime('now')
+         WHERE id = :tradeId
+             AND stock >= :amount
+             AND status = 'open'
+         RETURNING *
+         `,
+         {
+             tradeId: params.tradeId,
+             amount: params.amount,
+         },
+     );
+ }
+ 
+EOF
+)

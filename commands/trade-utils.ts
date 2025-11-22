@@ -1,4 +1,4 @@
-import type { BuyOrderRecord, TradeRecord, TradeStatus, UserRecord } from "../src/database";
+import type { BuyOrderRecord, BuyOrderStatus, TradeRecord, TradeStatus, UserRecord } from "../src/database";
 import type { MessageComponent } from "./types";
 
 const numberFormatter = new Intl.NumberFormat("en-US");
@@ -30,6 +30,19 @@ export function resolveStatusLabel(status: TradeStatus): string {
             return "In Escrow";
         case "expired":
             return "Expired";
+        default:
+            return status;
+    }
+}
+
+export function resolveBuyStatusLabel(status: BuyOrderStatus): string {
+    switch (status) {
+        case "open":
+            return "Open";
+        case "fulfilled":
+            return "Fulfilled";
+        case "cancelled":
+            return "Cancelled";
         default:
             return status;
     }
@@ -145,15 +158,27 @@ export function buildSellThreadName(trade: TradeRecord): string {
     return baseName;
 }
 
-export function buildBuyThreadName(order: Pick<BuyOrderRecord, "item" | "price">): string {
-    return `Buy: ${order.item} - ${formatAuecWithEmoji(order.price)}`;
+export function buildBuyThreadName(order: Pick<BuyOrderRecord, "item" | "price" | "status">): string {
+    const baseName = `Buy: ${order.item} - ${formatAuecWithEmoji(order.price)}`;
+
+    if (order.status === "fulfilled") {
+        return `✅ ${baseName} (Fulfilled)`;
+    }
+
+    if (order.status === "cancelled") {
+        return `✖️ ${baseName} (Cancelled)`;
+    }
+
+    return baseName;
 }
 
 export function buildBuyOrderEmbed(params: {
     order: BuyOrderRecord;
     userTag: string;
+    statusLabel?: string;
 }): Record<string, unknown> {
     const { order, userTag } = params;
+    const statusLabel = params.statusLabel ?? resolveBuyStatusLabel(order.status);
 
     const fields: Array<{ name: string; value: string; inline?: boolean }> = [
         { name: "Price", value: `${numberFormatter.format(order.price)} aUEC`, inline: true },
@@ -162,6 +187,10 @@ export function buildBuyOrderEmbed(params: {
 
     if (order.amount !== null) {
         fields.splice(1, 0, { name: "Desired Amount", value: `${order.amount}`, inline: true });
+    }
+
+    if (statusLabel) {
+        fields.push({ name: "Status", value: statusLabel, inline: true });
     }
 
     const embed: Record<string, unknown> = {
@@ -226,6 +255,10 @@ export function resolveForumThreadId(params: {
 
 export function shouldArchiveSellThread(status: TradeStatus): boolean {
     return status === "selled" || status === "complete" || status === "cancelled";
+}
+
+export function shouldArchiveBuyThread(status: BuyOrderStatus): boolean {
+    return status === "fulfilled" || status === "cancelled";
 }
 
 export async function updateForumThread(params: {
@@ -313,6 +346,7 @@ export async function deliverTradeAnnouncement(params: {
     embed: Record<string, unknown>;
     userId: string;
     appliedTags?: string[];
+    components?: MessageComponent[];
 }): Promise<AnnouncementResult> {
     const baseHeaders = {
         Authorization: `Bot ${params.token}`,
@@ -331,6 +365,7 @@ export async function deliverTradeAnnouncement(params: {
             body: JSON.stringify({
                 content: params.content,
                 embeds: [params.embed],
+                ...(params.components ? { components: params.components } : {}),
                 allowed_mentions: allowedMentions,
             }),
         });
@@ -355,6 +390,7 @@ export async function deliverTradeAnnouncement(params: {
             message: {
                 content: params.content,
                 embeds: [params.embed],
+                ...(params.components ? { components: params.components } : {}),
                 allowed_mentions: allowedMentions,
             },
         };
